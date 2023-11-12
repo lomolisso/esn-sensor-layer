@@ -1,0 +1,30 @@
+menu "Edge Sensor Configuration"
+
+    config PROV_TRANSPORT_BLE
+        bool "Enable BLE for provisioning"
+        default y
+        select BT_ENABLED
+        help
+            Use BLE as the provisioning transport. This also enables the necessary Bluetooth components in the ESP-IDF.
+    
+    config ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
+        bool "Enable Protocomm security version 1"
+        default y
+        help
+            Enable Protocomm security version 1. This is one of the security versions available for the Wi-Fi provisioning component.
+
+    config PROV_TRANSPORT
+        int
+        default 1 if PROV_TRANSPORT_BLE
+
+    config PROV_MGR_MAX_RETRY_CNT
+        int
+        default 5
+        prompt "Max retries before reseting provisioning state machine"
+        help
+            Set the Maximum retry to avoid reconnecting to an inexistent AP or if credentials
+            are misconfigured. Provisioned credentials are erased and internal state machine
+            is reset after this threshold is reached.
+            
+
+endmenu

@@ -1,0 +1,43 @@
+# Compiled source #
+###################
+*.o
+*.d
+*.elf
+*.map
+*.lss
+*.eep
+*.bin
+*.hex
+*.a
+*.so
+
+# ESP-IDF specific #
+####################
+build/
+
+# Miscellaneous #
+#################
+*~
+*.swp
+*.bak
+*.tmp
+*.log
+*.output
+
+# VSCode files #
+###############
+.vscode/
+
+# Eclipse files #
+#################
+.settings/
+.project
+.cproject
+.loadpath
+
+# Miscellaneous editors and tools #
+##################################
+*.pyc
+*.pyo
+*.egg-info
+*.idea/
