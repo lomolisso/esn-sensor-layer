@@ -4,14 +4,10 @@
 #include <stdlib.h> // for rand()
 #include <time.h>   // for time()
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_err.h"
 
-#include "cJSON.h"
 #include <string.h>
 
 #include "esp_sleep.h"
@@ -20,8 +16,18 @@
 #define EDGE_SENSOR_PARTITION_NAMESPACE "edge_sensor_ns"
 #define DEVICE_NAME_MAX_LENGTH 13
 
+#define START_COMMAND "edge-sensor-start"
+#define STOP_COMMAND "edge-sensor-stop"
+#define RESET_COMMAND "edge-sensor-reset"
+
+#define CONFIG_MEASUREMENT_INTERVAL_MS "config-measurement-interval-ms"
+#define CONFIG_RUN_PREDICTION "config-run-prediction"
+#define CONFIG_PREDICTIVE_MODEL "config-predictive-model"
+#define CONFIG_DONE "config-done"
+
 /* Utils */
-bool starts_with(const char *pre, const char *str) {
+bool starts_with(const char *pre, const char *str)
+{
     size_t lenpre = strlen(pre),
            lenstr = strlen(str);
     return lenstr < lenpre ? false : strncmp(pre, str, lenpre) == 0;
@@ -52,12 +58,59 @@ bool validate_json(cJSON *jsonPayload)
     return jsonPayload != NULL;
 }
 
-
 /* NVS */
+uint8_t is_edge_sensor_configured()
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    uint8_t configured = 0;
+
+    err = nvs_open_from_partition(EDGE_SENSOR_PARTITION, EDGE_SENSOR_PARTITION_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        return 0;
+    }
+
+    err = nvs_get_u8(nvs_handle, "configured", &configured);
+    if (err != ESP_OK)
+    {
+        return 0;
+    }
+
+    printf("Edge Sensor is configured: %d\n", configured);
+
+    nvs_close(nvs_handle);
+
+    return (configured == 1) ? 1 : 0;
+}
+
+esp_err_t reset_edge_sensor_config_from_nvs()
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+
+    err = nvs_open_from_partition(EDGE_SENSOR_PARTITION, EDGE_SENSOR_PARTITION_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+        return err;
+
+    /*
+    Setting the configured flag to 0 indicates that the edge sensor has not been configured.
+    This will cause the edge sensor to go through the initial state on the next boot. All
+    previous configuration will be overwritten once the edge sensor is configured again.
+    */
+    err = nvs_set_u8(nvs_handle, "configured", 0);
+    if (err != ESP_OK)
+        return err;
+
+    nvs_close(nvs_handle);
+
+    return ESP_OK;
+}
+
 esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open_from_partition(EDGE_SENSOR_PARTITION, EDGE_SENSOR_PARTITION_NAMESPACE, NVS_READONLY, &nvs_handle);
+    esp_err_t err;
 
     err = nvs_open_from_partition(EDGE_SENSOR_PARTITION, EDGE_SENSOR_PARTITION_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
@@ -73,7 +126,7 @@ esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor)
 
     if (edgeSensor->config)
     {
-        err = nvs_set_i32(nvs_handle, "measurementIntervalMS", edgeSensor->config->measurementIntervalMS);
+        err = nvs_set_u32(nvs_handle, "workInterval", edgeSensor->config->measurementIntervalMS);
         if (err != ESP_OK)
             return err;
 
@@ -81,7 +134,7 @@ esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor)
         if (err != ESP_OK)
             return err;
 
-        err = nvs_set_str(nvs_handle, "predictiveModel", edgeSensor->config->predictiveModel);
+        err = nvs_set_str(nvs_handle, "predModel", edgeSensor->config->predictiveModel);
         if (err != ESP_OK)
             return err;
     }
@@ -98,25 +151,6 @@ esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor)
 
     // Close NVS
     nvs_close(nvs_handle);
-
-    return ESP_OK;
-}
-
-esp_err_t check_edge_sensor_configured(uint8_t *configured)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err;
-
-    err = nvs_open_from_partition(EDGE_SENSOR_PARTITION, EDGE_SENSOR_PARTITION_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK)
-        return err;
-
-    err = nvs_get_u8(nvs_handle, "configured", configured);
-    if (err != ESP_OK)
-        return err;
-
-    nvs_close(nvs_handle);
-
     return ESP_OK;
 }
 
@@ -154,7 +188,7 @@ esp_err_t load_edge_sensor_from_nvs(EdgeSensor *edgeSensor, ES_Config *config, E
     xSemaphoreGive(stateMachine->stateSemaphore); // avoid waiting for semaphore in measurement task.
 
     // step 3: initialize config from NVS
-    err = nvs_get_u32(nvs_handle, "measurementIntervalMS", &edgeSensor->config->measurementIntervalMS);
+    err = nvs_get_u32(nvs_handle, "workInterval", &edgeSensor->config->measurementIntervalMS);
     if (err != ESP_OK)
         return err;
 
@@ -162,12 +196,12 @@ esp_err_t load_edge_sensor_from_nvs(EdgeSensor *edgeSensor, ES_Config *config, E
     if (err != ESP_OK)
         return err;
 
-    err = nvs_get_str(nvs_handle, "predictiveModel", NULL, &required_size);
+    err = nvs_get_str(nvs_handle, "predModel", NULL, &required_size);
     if (err != ESP_OK)
         return err;
 
     edgeSensor->config->predictiveModel = malloc(required_size);
-    err = nvs_get_str(nvs_handle, "predictiveModel", edgeSensor->config->predictiveModel, &required_size);
+    err = nvs_get_str(nvs_handle, "predModel", edgeSensor->config->predictiveModel, &required_size);
     if (err != ESP_OK)
         return err;
 
@@ -177,33 +211,37 @@ esp_err_t load_edge_sensor_from_nvs(EdgeSensor *edgeSensor, ES_Config *config, E
     return ESP_OK;
 }
 
-/* Edge Sensor Config */
-void es_config_command_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *jsonConfigField)
+/* Edge Sensor Config  Handler*/
+void es_config_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *jsonConfigField)
 {
-    if (strcmp(commandName, "config-measurement-interval-ms") == 0) {
+    if (strcmp(commandName, CONFIG_MEASUREMENT_INTERVAL_MS) == 0)
+    {
         cJSON *JSON_measurementIntervalMS = cJSON_GetObjectItem(jsonConfigField, commandName);
         edgeSensor->config->measurementIntervalMS = cJSON_IsNumber(JSON_measurementIntervalMS) ? JSON_measurementIntervalMS->valueint : 1000;
-
-    } else if (strcmp(commandName, "config-run-prediction") == 0) {
+    }
+    else if (strcmp(commandName, CONFIG_RUN_PREDICTION) == 0)
+    {
         cJSON *JSON_runPrediction = cJSON_GetObjectItem(jsonConfigField, commandName);
         edgeSensor->config->runPrediction = cJSON_IsTrue(JSON_runPrediction);
-
-    } else if (strcmp(commandName, "config-predictive-model") == 0) {
+    }
+    else if (strcmp(commandName, CONFIG_PREDICTIVE_MODEL) == 0)
+    {
         cJSON *JSON_predictiveModel = cJSON_GetObjectItem(jsonConfigField, commandName);
         size_t required_size = strlen(JSON_predictiveModel->valuestring) + 1;
-        edgeSensor->config->predictiveModel = (char *) malloc(required_size);
+        edgeSensor->config->predictiveModel = (char *)malloc(required_size);
         strcpy(edgeSensor->config->predictiveModel, JSON_predictiveModel->valuestring);
-
-
-    } else if (strcmp(commandName, "config-done") == 0) {
+    }
+    else if (strcmp(commandName, CONFIG_DONE) == 0)
+    {
         /* handle event CONFIG_COMMAND_RECEIVED */
         printf("Edge Sensor taking mutex\n");
         xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
         edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_CONFIG_COMMAND_RECEIVED);
         xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
         printf("Edge Sensor released mutex\n");
-
-    } else {
+    }
+    else
+    {
         printf("Config command '%s' not recognized.\n", commandName);
     }
 }
@@ -223,35 +261,34 @@ void es_command_handler(EdgeSensor *edgeSensor, const char *commandName, const c
         /* handle command */
         if (starts_with("config", commandName))
         {
-            es_config_command_handler(edgeSensor, commandName, jsonPayload);
+            es_config_handler(edgeSensor, commandName, jsonPayload);
         }
-        else if (strcmp(commandName, "edge-sensor-working-status") == 0)
+        else if (strcmp(commandName, START_COMMAND) == 0)
         {
-            cJSON *workingStatus = cJSON_GetObjectItem(jsonPayload, commandName);
-            if (cJSON_IsTrue(workingStatus))
-            {
-                /* handle event START_COMMAND_RECEIVED */
-                printf("Edge Sensor taking mutex\n");
-                xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
-                edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_START_COMMAND_RECEIVED);
-                xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
-                printf("Edge Sensor released mutex\n");
-            }
-            else
-            {
-                /* handle event STOP_COMMAND_RECEIVED */
-                printf("Edge Sensor taking mutex\n");
-                xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
-                edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_STOP_COMMAND_RECEIVED);
-                xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
-                printf("Edge Sensor released mutex\n");
-            }
+            /* handle event START_COMMAND_RECEIVED */
+            printf("Edge Sensor asks for the mutex\n");
+            xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
+            printf("Edge Sensor received the mutex\n");
+            edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_START_COMMAND_RECEIVED);
+            xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
+            printf("Edge Sensor released mutex\n");
         }
-        else if (strcmp(commandName, "edge-sensor-reset") == 0)
+        else if (strcmp(commandName, STOP_COMMAND) == 0)
+        {
+            /* handle event STOP_COMMAND_RECEIVED */
+            printf("Edge Sensor asks for the mutex\n");
+            xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
+            printf("Edge Sensor received the mutex\n");
+            edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_STOP_COMMAND_RECEIVED);
+            xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
+            printf("Edge Sensor released mutex\n");
+        }
+        else if (strcmp(commandName, RESET_COMMAND) == 0)
         {
             /* handle event RESET_COMMAND_RECEIVED */
-            printf("Edge Sensor taking mutex\n");
+            printf("Edge Sensor asks for the mutex\n");
             xSemaphoreTake(edgeSensor->stateMachine->stateMutex, portMAX_DELAY);
+            printf("Edge Sensor received the mutex\n");
             edgeSensor->stateMachine->stateHandler(edgeSensor, EVENT_RESET_COMMAND_RECEIVED);
             xSemaphoreGive(edgeSensor->stateMachine->stateMutex);
             printf("Edge Sensor released mutex\n");
@@ -261,29 +298,20 @@ void es_command_handler(EdgeSensor *edgeSensor, const char *commandName, const c
             printf("Command '%s' not recognized.\n", commandName);
         }
     }
-    else if (strcmp(commandMethod, "get") == 0)
-    {
-        // TODO: implement get command
-    }
     else
     {
         printf("Command method '%s' not recognized.\n", commandMethod);
     }
 }
 
-/* State Machine handlers*/
+/* State Machine Event handlers */
 void state_initial_handler(EdgeSensor *edgeSensor, ES_Event event)
 {
     if (event == EVENT_CONFIG_COMMAND_RECEIVED)
     {
-        // step 1: update state machine
         edgeSensor->stateMachine->state = STATE_CONFIGURED;
         edgeSensor->stateMachine->stateHandler = state_configured_handler;
         printf("Edge Sensor has transitioned to STATE_CONFIGURED.\n");
-
-        // step 2: store edge sensor in NVS for recovery after deep sleep
-        save_edge_sensor_to_nvs(edgeSensor);
-        printf("Edge Sensor has been stored in NVS.\n");
     }
 }
 
@@ -296,7 +324,11 @@ void state_configured_handler(EdgeSensor *edgeSensor, ES_Event event)
         edgeSensor->stateMachine->stateHandler = state_working_handler;
         printf("Edge Sensor has transitioned to STATE_WORKING.\n");
 
-        // step 2: signal measurement task to start
+        // step 2: store edge sensor in NVS for recovery after deep sleep
+        ESP_ERROR_CHECK(save_edge_sensor_to_nvs(edgeSensor));
+        printf("Edge Sensor has been stored in NVS.\n");
+
+        // step 3: signal measurement task to start
         xSemaphoreGive(edgeSensor->stateMachine->stateSemaphore);
         printf("Measurement task has been signaled to start.\n");
     }
@@ -306,11 +338,10 @@ void state_working_handler(EdgeSensor *edgeSensor, ES_Event event)
 {
     if (event == EVENT_STOP_COMMAND_RECEIVED)
     {
+        // step 1: update state machine
         edgeSensor->stateMachine->state = STATE_STOPPED;
         edgeSensor->stateMachine->stateHandler = state_stopped_handler;
         printf("Edge Sensor has transitioned to STATE_STOPPED.\n");
-        xSemaphoreTake(edgeSensor->stateMachine->stateSemaphore, portMAX_DELAY);
-        printf("Measurement task has been signaled to stop.\n");
     }
 }
 
@@ -318,34 +349,32 @@ void state_stopped_handler(EdgeSensor *edgeSensor, ES_Event event)
 {
     if (event == EVENT_START_COMMAND_RECEIVED)
     {
+        // step 1: update state machine
         edgeSensor->stateMachine->state = STATE_WORKING;
         edgeSensor->stateMachine->stateHandler = state_working_handler;
         printf("Edge Sensor has transitioned to STATE_WORKING.\n");
+
+        // step 2: signal measurement task to start
         xSemaphoreGive(edgeSensor->stateMachine->stateSemaphore);
         printf("Measurement task has been signaled to start.\n");
     }
     else if (event == EVENT_RESET_COMMAND_RECEIVED)
     {
+        // step 1: update state machine
         edgeSensor->stateMachine->state = STATE_INITIAL;
         edgeSensor->stateMachine->stateHandler = state_initial_handler;
         printf("Edge Sensor has transitioned to STATE_INITIAL.\n");
+
+        // step 2: reset edge sensor configuration from NVS
+        reset_edge_sensor_config_from_nvs();
     }
 }
 
 /* Edge Sensor Functions */
 void edge_sensor_init(EdgeSensor *edgeSensor, ES_Config *config, ES_StateMachine *stateMachine, char *deviceName)
 {
-    // step 0: initialize random number generator (test)
+    // step 1: initialize random number generator (test)
     init_random();
-
-    // step 1: check if edge sensor has been configured
-    uint8_t configured = 0;
-    check_edge_sensor_configured(&configured);
-    if (configured)
-    {
-        load_edge_sensor_from_nvs(edgeSensor, config, stateMachine, deviceName);
-        return;
-    }
 
     // step 2: initialize Edge Sensor
     edgeSensor->deviceName = deviceName;
@@ -370,15 +399,14 @@ float edge_sensor_predict(EdgeSensor *edgeSensor, float measurement)
     return get_random_float32();
 }
 
-
 void edge_sensor_sleep(EdgeSensor *edgeSensor)
 {
     // Calculate sleep time in microseconds
     int64_t sleepTimeMicroseconds = (int64_t)edgeSensor->config->measurementIntervalMS * 1000;
 
     // Free predictive model allocated memory
-    free(edgeSensor->config->predictiveModel);
-            
+    // free(edgeSensor->config->predictiveModel);
+
     // Set the wake up time for the ESP32
     esp_sleep_enable_timer_wakeup(sleepTimeMicroseconds);
 

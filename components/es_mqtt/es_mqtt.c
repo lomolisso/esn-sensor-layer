@@ -141,16 +141,26 @@ void subscribe_to_config_topics(esp_mqtt_client_handle_t client, char *device_na
     }
 }
 
-void subscribe_to_working_status_topic(esp_mqtt_client_handle_t client, char *device_name) {
+void subscribe_to_start_topic(esp_mqtt_client_handle_t client, char *device_name) {
     /* Get subscribe topic */
-    char working_status_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_subscribe_topic(working_status_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, "edge-sensor-working-status", "set");
+    char start_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_subscribe_topic(start_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, "edge-sensor-start", "set");
 
-    /* Subscribe to working status topic */
-    int msg_id = esp_mqtt_client_subscribe(client, working_status_command_topic_buffer, 0);
+    /* Subscribe to start topic */
+    int msg_id = esp_mqtt_client_subscribe(client, start_command_topic_buffer, 0);
 
-    ESP_LOGI(TAG, "successfully subscribed to topic '%s', msg_id=%d", working_status_command_topic_buffer, msg_id);
+    ESP_LOGI(TAG, "successfully subscribed to topic '%s', msg_id=%d", start_command_topic_buffer, msg_id);
+}
 
+void subscribe_to_stop_topic(esp_mqtt_client_handle_t client, char *device_name) {
+    /* Get subscribe topic */
+    char stop_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_subscribe_topic(stop_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, "edge-sensor-stop", "set");
+
+    /* Subscribe to stop topic */
+    int msg_id = esp_mqtt_client_subscribe(client, stop_command_topic_buffer, 0);
+
+    ESP_LOGI(TAG, "successfully subscribed to topic '%s', msg_id=%d", stop_command_topic_buffer, msg_id);
 }
 
 void subscribe_to_reset_topic(esp_mqtt_client_handle_t client, char *device_name) {
@@ -163,7 +173,6 @@ void subscribe_to_reset_topic(esp_mqtt_client_handle_t client, char *device_name
 
     ESP_LOGI(TAG, "successfully subscribed to topic '%s', msg_id=%d", reset_command_topic_buffer, msg_id);
 }
-
 
 void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
@@ -183,7 +192,8 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
 
         /* Subscribe to commands topics */
         subscribe_to_config_topics(client, edgeSensor->deviceName);
-        subscribe_to_working_status_topic(client, edgeSensor->deviceName);
+        subscribe_to_start_topic(client, edgeSensor->deviceName);
+        subscribe_to_stop_topic(client, edgeSensor->deviceName);
         subscribe_to_reset_topic(client, edgeSensor->deviceName);
         break;
     case MQTT_EVENT_DATA:
@@ -203,8 +213,6 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
 
         /* Call edge sensor command handler */
         edgeSensor->commandHandler(edgeSensor, command_name_buffer, command_method_buffer, event->data);
-
-        // command/ESP32_1394C2/config-measurement-interval-ms/set/3ef5f15b-d656-4e15-9498-29067f53bba0
 
         /* Publish command response to MQTT broker */
         char *response = event->data; // TODO: replace by actual response.
