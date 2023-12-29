@@ -1,20 +1,21 @@
 #include "es_ble_prov.h"
 
 #include <freertos/FreeRTOS.h>
-#include <freertos/event_groups.h>
+#include <freertos/semphr.h>
+
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <nvs_flash.h>
+
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
 #include "esp_mac.h"
 
 static const char *TAG = "ES_BLE_PROV";
 
-/* Signal Wi-Fi events on this event-group */
-const int WIFI_CONNECTED_EVENT = BIT0;
-static EventGroupHandle_t wifi_event_group;
+/* Signal Wi-Fi events */
+static SemaphoreHandle_t wifi_semaphore;
 
 /* Bluetooth Config */
 #define PROV_TRANSPORT_BLE "ble"
@@ -124,7 +125,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     ESP_LOGI(TAG, "Connected with IP Address:" IPSTR, IP2STR(&event->ip_info.ip));
     /* Signal main application to continue execution */
-    xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+    xSemaphoreGive(wifi_semaphore);
 }
 
 static void protocomm_transport_ble_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -168,12 +169,12 @@ static void wifi_init_sta(void)
 }
 
 void ble_prov_init(void)
-{   
-    
+{
+
     /* Initialize NVS PoP partition */
     ESP_ERROR_CHECK(nvs_flash_init_partition(EDGE_SENSOR_PARTITION));
 
-    wifi_event_group = xEventGroupCreate();
+    wifi_semaphore = xSemaphoreCreateBinary();
 
     /* Register our event handler for Wi-Fi, IP and Provisioning related events */
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &wifi_prov_event_handler, NULL));
@@ -190,8 +191,7 @@ void ble_prov_init(void)
     /* Configuration for the provisioning manager */
     wifi_prov_mgr_config_t config = {
         .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM
-    };
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
 
     /* Initialize provisioning manager with the
      * configuration parameters set above */
@@ -201,7 +201,7 @@ void ble_prov_init(void)
 void start_ble_prov(void)
 {
     bool provisioned = false;
-    //wifi_prov_mgr_reset_provisioning(); // TODO: comment on PROD.
+    // wifi_prov_mgr_reset_provisioning(); // TODO: comment on PROD.
 
     /* Let's find out if the device is provisioned */
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
@@ -213,46 +213,43 @@ void start_ble_prov(void)
         char device_name[13];
         ESP_ERROR_CHECK(get_device_name(device_name, sizeof(device_name)));
 
-        /*
-         *  WIFI_PROV_SECURITY_1 is secure communication which consists of secure handshake
-         *  using X25519 key exchange and proof of possession (pop) and AES-CTR
-         *  for encryption/decryption of messages.
-         */
+        /* 
+        WIFI_PROV_SECURITY_1: secure handshake using X25519 key exchange
+        and proof of possession (pop) and AES-CTR for encryption/decryption of messages. 
+        */
         wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
 
         // Retrieve the PoP from the NVS partition
-        char pop[EDGE_SENSOR_BUFFER_SIZE] = {0};     // Initialize all elements to 0
-        size_t pop_length = sizeof(pop) - 1; // Reserve one byte for null terminator
+        char pop[EDGE_SENSOR_BUFFER_SIZE] = {0}; // Initialize all elements to 0
+        size_t pop_length = sizeof(pop) - 1;     // Reserve one byte for null terminator
         ESP_ERROR_CHECK(get_device_pop(pop, pop_length));
-        
 
         wifi_prov_security1_params_t *sec_params = pop;
 
-        /* This step is only useful when scheme is wifi_prov_scheme_ble. This will
-         * set a custom 128 bit UUID which will be included in the BLE advertisement
-         * and will correspond to the primary GATT service that provides provisioning
-         * endpoints as GATT characteristics. Each GATT characteristic will be
-         * formed using the primary service UUID as base, with different auto assigned
-         * 12th and 13th bytes (assume counting starts from 0th byte). The client side
-         * applications must identify the endpoints by reading the User Characteristic
-         * Description descriptor (0x2901) for each characteristic, which contains the
-         * endpoint name of the characteristic */
         uint8_t custom_service_uuid[] = {
-            0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
-            0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02,
+            0xb4,
+            0xdf,
+            0x5a,
+            0x1c,
+            0x3f,
+            0x6b,
+            0xf4,
+            0xbf,
+            0xea,
+            0x4a,
+            0x82,
+            0x03,
+            0x04,
+            0x90,
+            0x1a,
+            0x02,
         };
 
-        /* If your build fails with linker errors at this point, then you may have
-         * forgotten to enable the BT stack or BTDM BLE settings in the SDK (e.g. see
-         * the sdkconfig.defaults in the example project) */
         wifi_prov_scheme_ble_set_service_uuid(custom_service_uuid);
 
         /* Start provisioning service */
         ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, (const void *)sec_params, device_name, NULL));
 
-        /* Uncomment the following to wait for the provisioning to finish and then release
-         * the resources of the manager. Since in this case de-initialization is triggered
-         * by the default event loop handler, we don't need to call the following */
         wifi_prov_mgr_wait();
         wifi_prov_mgr_deinit();
     }
@@ -269,5 +266,5 @@ void start_ble_prov(void)
     }
 
     /* Wait for Wi-Fi connection */
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+    xSemaphoreTake(wifi_semaphore, portMAX_DELAY);
 }

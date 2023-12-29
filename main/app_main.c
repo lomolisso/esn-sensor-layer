@@ -9,16 +9,18 @@
 #include "freertos/semphr.h"
 
 #include "esp_err.h"
-
+#include "es_tflite.h"
 #include "cJSON.h"
+
+#include "esp_heap_caps.h"
+
 
 // static const char *TAG = "APP_MAIN";
 
 #define DEVICE_NAME_MAX_LENGTH 13
-static char deviceName[DEVICE_NAME_MAX_LENGTH];
+
 static EdgeSensor edgeSensor;
-static ES_Config config;
-static ES_StateMachine stateMachine;
+static char deviceName[DEVICE_NAME_MAX_LENGTH];
 
 typedef struct measurementTaskParams
 {
@@ -26,47 +28,50 @@ typedef struct measurementTaskParams
     esp_mqtt_client_handle_t client;
 } MeasurementTaskParams;
 
+void printHeapInfo() {
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    printf("Free heap size: %zu bytes\n", freeHeap);
+    size_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    printf("Largest free contiguous heap block: %zu bytes\n", largestFreeBlock);
+}
+
 void edge_sensor_measurement_task(void *pvParameters)
 {
     MeasurementTaskParams *params = (MeasurementTaskParams *)pvParameters;
     EdgeSensor *edgeSensor = params->edgeSensor;
+    SemaphoreHandle_t commandSemaphore = edgeSensor->commandSemaphore;
     ES_StateMachine *stateMachine = edgeSensor->stateMachine;
     esp_mqtt_client_handle_t client = params->client;
 
     while (true)
-    {
-        // Wait for semaphore to be given
-        printf("Measurement task waiting for signal\n");
-        xSemaphoreTake(stateMachine->stateSemaphore, portMAX_DELAY);
-        printf("Measurement task received signal\n");
+    {   
+        /* Wait for command signal */
+        printf("Measurement task waiting for command signal\n");
+        xSemaphoreTake(commandSemaphore, portMAX_DELAY);
+        printf("Measurement task received command signal\n");
 
-        // Check state under mutex protection
-        printf("Measurement task waiting for mutex\n");
-        xSemaphoreTake(stateMachine->stateMutex, portMAX_DELAY);
-        printf("Measurement task received mutex\n");
-        ES_State state = stateMachine->state;
-        xSemaphoreGive(stateMachine->stateMutex);
-        printf("Measurement task released mutex\n");
+        /* Check state and perform measurement */
+        if (stateMachine->state == STATE_WORKING) {
+            // Edge Sensor takes a measurement
+            float measurement = edge_sensor_measure(edgeSensor);
 
-        if (state != STATE_WORKING) break;
+            // Edge Sensor makes a prediction if necessary
+            float prediction;
+            float *prediction_ptr = NULL;
 
-        // Edge Sensor takes a measurement
-        float measurement = edge_sensor_measure(edgeSensor);
+            if (edgeSensor->predictiveModel != NULL) {
+                es_tflite_predict(&measurement, &prediction);
+                prediction_ptr = &prediction;
+            }
 
-        // Edge Sensor makes a prediction if necessary
-        float prediction;
-        float *prediction_ptr = NULL;
-        if (edgeSensor->config->runPrediction)
-        {
-            prediction = edge_sensor_predict(edgeSensor, measurement);
-            prediction_ptr = &prediction;
+            // Publish measurement to MQTT broker
+            publish_measurement(client, edgeSensor->deviceName, measurement, prediction_ptr);
         }
-
-        // Publish measurement to MQTT broker
-        publish_measurement(client, edgeSensor->deviceName, measurement, prediction_ptr);
-
-        // Deep sleep
-        printf("Measurement task going to sleep\n");
+        
+        /* Save edge sensor to NVS */
+        ESP_ERROR_CHECK(save_edge_sensor_to_nvs(edgeSensor));
+        
+        printf("Measurement task called edge_sensor_sleep\n");
         edge_sensor_sleep(edgeSensor);
     }
 }
@@ -81,6 +86,9 @@ void app_init(void)
 
     /* Initialize event loop */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* Initialize BLE Prov*/
+    ble_prov_init();
 }
 
 void app_main(void)
@@ -88,29 +96,21 @@ void app_main(void)
     /* Initialize App */
     app_init();
 
-    /* Initialize BLE Prov*/
-    ble_prov_init();
-
     /* Start BLE Prov */
     start_ble_prov();
 
     /* Get device name from BLE iface MAC address */
     get_device_name(deviceName, DEVICE_NAME_MAX_LENGTH);
 
-    uint8_t is_configured = is_edge_sensor_configured();
-    // ESP_ERROR_CHECK(reset_edge_sensor_config_from_nvs());
-
-    if (is_configured)
-    {
-        /* Load edge sensor config from NVS */
-        printf("Loading edge sensor config from NVS\n");
-        ESP_ERROR_CHECK(load_edge_sensor_from_nvs(&edgeSensor, &config, &stateMachine, deviceName));
-    }
-    else {
-        /* Initialize edge sensor config */
-        printf("Initializing edge sensor from scratch\n");
-        edge_sensor_init(&edgeSensor, &config, &stateMachine, deviceName);
-    }
+    //ESP_ERROR_CHECK(reset_nvs_edge_sensor());
+    uint8_t sleep_flag = get_nvs_edge_sensor_sleep_flag();
+    uint8_t model_flag = get_nvs_edge_sensor_model_flag();
+    uint8_t config_flag = get_nvs_edge_sensor_config_flag();
+    printHeapInfo();
+    ESP_ERROR_CHECK(edge_sensor_init(&edgeSensor, deviceName, sleep_flag, model_flag, config_flag));
+    printf("Edge sensor initialized\n");
+    printHeapInfo();
+    es_tflite_init(edgeSensor.predictiveModel);
 
     /* Initialize MQTT */
     esp_mqtt_client_handle_t client = mqtt_init();

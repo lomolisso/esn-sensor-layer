@@ -6,22 +6,41 @@
 
 #include "cJSON.h"
 
+/* NVS */
+#define EDGE_SENSOR_PARTITION "edge_sensor_data"
+#define EDGE_SENSOR_PARTITION_NAMESPACE "edge_sensor_ns"
+
+/* Predictive model commands */
+#define PM_SIZE_COMMAND "predictive-model-size"
+#define PM_B64_COMMAND "predictive-model-b64"
+
+/* Config commands */
+#define CONFIG_MEASUREMENT_INTERVAL_MS_COMMAND "config-measurement-interval-ms"
+
+/* State machine commands */
+#define SM_READY_COMMAND "state-machine-ready"
+#define SM_START_COMMAND "state-machine-start"
+#define SM_STOP_COMMAND "state-machine-stop"
+#define SM_RESET_COMMAND "state-machine-reset"
+
+
 // Forward Declarations
 typedef struct edgeSensor EdgeSensor;
 typedef struct _ES_StateMachine ES_StateMachine;
+typedef struct _ES_PredictiveModel ES_PredictiveModel;
 typedef struct _ES_Config ES_Config;
 
 // Edge Sensor States
 typedef enum _ES_State {
     STATE_INITIAL,
-    STATE_CONFIGURED,
+    STATE_READY,
     STATE_WORKING,
     STATE_STOPPED,
 } ES_State;
 
 // Edge Sensor Events
 typedef enum _ES_Event {
-    EVENT_CONFIG_COMMAND_RECEIVED,
+    EVENT_READY_COMMAND_RECEIVED,
     EVENT_START_COMMAND_RECEIVED,
     EVENT_STOP_COMMAND_RECEIVED,
     EVENT_RESET_COMMAND_RECEIVED,
@@ -29,54 +48,61 @@ typedef enum _ES_Event {
 
 // Function Pointer Types using Forward Declarations
 typedef void (*StateHandler)(EdgeSensor *edgeSensor, ES_Event event);
-typedef void (*ES_CommandHandler)(EdgeSensor *edgeSensor, const char *commandName, const char *commandMethod, const char *payload);
+typedef void (*ES_CommandHandler)(EdgeSensor *edgeSensor, const char *commandName, cJSON *payload);
+
+// ES_PredictiveModel Structure
+struct _ES_PredictiveModel {
+    size_t size;
+    uint8_t *buffer;
+};
 
 // ES_Config Structure
 struct _ES_Config {
     uint32_t measurementIntervalMS;
-    uint8_t runPrediction;
-    char *predictiveModel;
 };
 
 // ES_State Machine Structure
 struct _ES_StateMachine {
     ES_State state;
     StateHandler stateHandler;
-    SemaphoreHandle_t stateMutex;
-    SemaphoreHandle_t stateSemaphore;
-};
-
-// ES_PredictiveModel Structure
-struct _ES_PredictiveModel {
-    char *modelPath;
 };
 
 // Edge Sensor Structure
 struct edgeSensor {
     char *deviceName;
+
+    int *pendingCommands;
     ES_CommandHandler commandHandler;
-    ES_Config *config;
+    SemaphoreHandle_t commandSemaphore;
+
     ES_StateMachine *stateMachine;
+    ES_PredictiveModel *predictiveModel;
+    ES_Config *config;
 };
 
 // Function Declarations
 void state_initial_handler(EdgeSensor *edgeSensor, ES_Event event);
-void state_configured_handler(EdgeSensor *edgeSensor, ES_Event event);
+void state_ready_handler(EdgeSensor *edgeSensor, ES_Event event);
 void state_working_handler(EdgeSensor *edgeSensor, ES_Event event);
 void state_stopped_handler(EdgeSensor *edgeSensor, ES_Event event);
 
-void es_command_handler(EdgeSensor *edgeSensor, const char *commandName, const char *commandMethod, const char *payload);
-void es_config_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *jsonConfigField);
+void es_command_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *payload);
+void es_state_machine_command_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *payload);
+void es_predictive_model_command_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *payload);
+void es_config_command_handler(EdgeSensor *edgeSensor, const char *commandName, cJSON *payload);
 
-uint8_t is_edge_sensor_configured();
-esp_err_t reset_edge_sensor_config_from_nvs();
 esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor);
-esp_err_t load_edge_sensor_from_nvs(EdgeSensor *edgeSensor, ES_Config *config, ES_StateMachine *stateMachine, char *deviceName);
+esp_err_t set_nvs_edge_sensor_model_flag();
+esp_err_t set_nvs_edge_sensor_config_flag();
+esp_err_t set_nvs_edge_sensor_sleep_flag();
+uint8_t get_nvs_edge_sensor_model_flag();
+uint8_t get_nvs_edge_sensor_config_flag();
+uint8_t get_nvs_edge_sensor_sleep_flag();
+esp_err_t reset_nvs_edge_sensor();
 
-void edge_sensor_init(EdgeSensor *edgeSensor, ES_Config *config, ES_StateMachine *stateMachine, char *deviceName);
+esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName, uint8_t sleep_flag, uint8_t model_flag, uint8_t config_flag);
 
 float edge_sensor_measure(EdgeSensor *edgeSensor);
-float edge_sensor_predict(EdgeSensor *edgeSensor, float prediction);
 
 void edge_sensor_sleep(EdgeSensor *edgeSensor);
 
