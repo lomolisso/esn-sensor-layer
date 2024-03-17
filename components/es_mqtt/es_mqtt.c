@@ -23,9 +23,10 @@
 #define RESPONSE_PENDING_COMMANDS "response-pending-commands"
 
 /* Publish topics */
-#define EXPORT_DATA "edge-sensor-export-data"
+#define EXPORT_DATA "export-data"
+#define PREDICTION_LOG "debug-prediction-log"
 
-static const char *CONFIG_BROKER_URL = "mqtt://192.168.4.135:1883";
+static const char *CONFIG_BROKER_URL = "mqtt://192.168.4.1:1883";
 static const char *TAG = "ES_MQTT";
 
 /* MQTT Utils */
@@ -107,6 +108,7 @@ void publish_request_pending_commands(esp_mqtt_client_handle_t client, char *dev
     /* Create JSON payload using cJSON */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, REQUEST_PENDING_COMMANDS, pending_commands);
+
     char *payload = cJSON_Print(root);
     cJSON_Delete(root); // Free the cJSON object
 
@@ -118,22 +120,12 @@ void publish_request_pending_commands(esp_mqtt_client_handle_t client, char *dev
     esp_mqtt_client_publish(client, pending_commands_topic_buffer, payload, 0, 2, 0);
 
     ESP_LOGI(TAG, "published %s on topic %s", payload, pending_commands_topic_buffer);
+    free(payload);
 }
 
-void publish_measurement(esp_mqtt_client_handle_t client, char *device_name, float measurement, float *prediction_ptr)
+void publish_measurement(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
 {
-    /* Create JSON payload using cJSON */
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "measurement", measurement);
-
-    /* If prediction is not null, add it to the payload */
-    if (prediction_ptr != NULL)
-        cJSON_AddNumberToObject(root, "prediction", *prediction_ptr);
-    else
-        cJSON_AddNullToObject(root, "prediction");
-
-    char *payload = cJSON_Print(root);
-    cJSON_Delete(root); // Free the cJSON object
+    char *payload = cJSON_Print(jsonPayload);
 
     /* Get publish topic */
     char measurement_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
@@ -143,6 +135,61 @@ void publish_measurement(esp_mqtt_client_handle_t client, char *device_name, flo
     esp_mqtt_client_publish(client, measurement_topic_buffer, payload, 0, 1, 0);
 
     ESP_LOGI(TAG, "published %s on topic %s", payload, measurement_topic_buffer);
+    free(payload);
+}
+
+void publish_cloud_prediction_request(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
+{
+    char *payload = cJSON_Print(jsonPayload);
+
+    /* Get publish topic */
+    char prediction_request_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_publish_topic(prediction_request_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, CLOUD_PREDICTION_REQUEST);
+
+    /* Publish measurement to MQTT broker */
+    esp_mqtt_client_publish(client, prediction_request_topic_buffer, payload, 0, 1, 0);
+
+    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_request_topic_buffer);
+    free(payload);
+}
+
+void publish_gateway_prediction_request(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
+{
+    char *payload = cJSON_Print(jsonPayload);
+
+    /* Get publish topic */
+    char prediction_request_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_publish_topic(prediction_request_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, GATEWAY_PREDICTION_REQUEST);
+
+    /* Publish measurement to MQTT broker */
+    esp_mqtt_client_publish(client, prediction_request_topic_buffer, payload, 0, 1, 0);
+
+    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_request_topic_buffer);
+    free(payload);
+}
+
+void publish_prediction_request(esp_mqtt_client_handle_t client, char *deviceName, cJSON *jsonPayload, uint8_t predLayers) {
+    if (PREDICTION_ON_GATEWAY(predLayers)) {
+        publish_gateway_prediction_request(client, deviceName, jsonPayload);
+    }
+    if (PREDICTION_ON_CLOUD(predLayers)) {
+        publish_cloud_prediction_request(client, deviceName, jsonPayload);
+    }
+}
+
+void publish_prediction_log(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
+{
+    char *payload = cJSON_Print(jsonPayload);
+
+    /* Get publish topic */
+    char prediction_log_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_publish_topic(prediction_log_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, PREDICTION_LOG);
+
+    /* Publish measurement to MQTT broker */
+    esp_mqtt_client_publish(client, prediction_log_topic_buffer, payload, 0, 1, 0);
+
+    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_log_topic_buffer);
+    free(payload);
 }
 
 /* MQTT Subscribe */
@@ -187,8 +234,8 @@ void subscribe_to_predictive_model_topics(esp_mqtt_client_handle_t client, char 
 {
     /* List of predictive model topics */
     char *predictive_model_topics[] = {
-        PM_SIZE_COMMAND,
-        PM_B64_COMMAND
+        PREDICTIVE_MODEL_COMMAND,
+        PREDICTION_COMMAND
     };
 
     char predictive_model_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
@@ -209,7 +256,7 @@ void subscribe_to_config_topics(esp_mqtt_client_handle_t client, char *device_na
 {
     /* List of config topics */
     char *config_topics[] = {
-        CONFIG_MEASUREMENT_INTERVAL_MS_COMMAND
+        CONFIG_DEVICE_COMMAND
     };
 
     char config_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
@@ -309,17 +356,30 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
         else 
         {
             /* call edge sensor command handler */
+            printf("Calling edge sensor command handler for command %s\n", commandName);
             edgeSensor->commandHandler(edgeSensor, commandName, jsonPayload);
         }
         
         /* free JSON payload */
         cJSON_Delete(jsonPayload);
 
+        if (ESN_DEBUG_MODE && edgeSensor->predictionLogJson != NULL) {
+            /* Publish prediction log to MQTT broker */
+            publish_prediction_log(client, edgeSensor->deviceName, edgeSensor->predictionLogJson);
+            cJSON_Delete(edgeSensor->predictionLogJson);
+            
+            /* Reset predictionLogJson to NULL */
+            edgeSensor->predictionLogJson = NULL;
+        }
+        
         /* Publish command response to MQTT broker */
-        char *response = event->data; // TODO: replace by actual response.
+        cJSON *commandResponse = cJSON_CreateObject();
+        cJSON_AddStringToObject(commandResponse, commandName, "success");
+        char *response = cJSON_Print(commandResponse);
         publish_command_response(client, edgeSensor->deviceName, commandUUID, response);
+        free(response);
+        cJSON_Delete(commandResponse);
         break;
-
     default:
         break;
     }

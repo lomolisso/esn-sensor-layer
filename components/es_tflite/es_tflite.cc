@@ -27,7 +27,7 @@ extern "C" void es_tflite_init(ES_PredictiveModel *predictiveModel)
         MicroPrintf("Model is null");
         return;
     }
-    
+
     model = tflite::GetModel(predictiveModel->buffer);
     if (model->version() != TFLITE_SCHEMA_VERSION)
     {
@@ -72,14 +72,11 @@ extern "C" void es_tflite_predict(float *inputData, float *outputData)
     // inference_count to the number of inferences per cycle to determine
     // our position within the range of possible x values the model was
     // trained on, and use this to calculate a value.
-    MicroPrintf("inputData: %f\n", static_cast<double>(*inputData));
 
     float x = (*inputData) * kXrange;
-    MicroPrintf("x: %f\n", static_cast<double>(x));
 
     // Quantize the input from floating-point to integer
     int8_t x_quantized = x / input->params.scale + input->params.zero_point;
-    MicroPrintf("x_quantized: %d\n", x_quantized);
 
     // Place the quantized input in the model's input tensor
     input->data.int8[0] = x_quantized;
@@ -92,14 +89,11 @@ extern "C" void es_tflite_predict(float *inputData, float *outputData)
                     static_cast<double>(x));
         return;
     }
-    MicroPrintf("Output: %d\n", output->data.int8[0]);
 
     // Obtain the quantized output from model's output tensor
     int8_t y_quantized = output->data.int8[0];
-    MicroPrintf("y_quantized: %d\n", y_quantized);
 
     // Dequantize the output from integer to floating-point
     float y = (y_quantized - output->params.zero_point) * output->params.scale;
-    MicroPrintf("y: %f\n", static_cast<double>(y));
     *outputData = y;
 }

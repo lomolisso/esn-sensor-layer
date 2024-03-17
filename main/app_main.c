@@ -13,7 +13,7 @@
 #include "cJSON.h"
 
 #include "esp_heap_caps.h"
-
+#include "esp_timer.h"
 
 // static const char *TAG = "APP_MAIN";
 
@@ -28,11 +28,17 @@ typedef struct measurementTaskParams
     esp_mqtt_client_handle_t client;
 } MeasurementTaskParams;
 
+/* Utils */
 void printHeapInfo() {
     size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     printf("Free heap size: %zu bytes\n", freeHeap);
     size_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     printf("Largest free contiguous heap block: %zu bytes\n", largestFreeBlock);
+}
+
+void from_float_to_string(float value, char *buffer)
+{
+    sprintf(buffer, "%f", value);
 }
 
 void edge_sensor_measurement_task(void *pvParameters)
@@ -52,20 +58,67 @@ void edge_sensor_measurement_task(void *pvParameters)
 
         /* Check state and perform measurement */
         if (stateMachine->state == STATE_WORKING) {
-            // Edge Sensor takes a measurement
+            /* Compute inference layers */
+            uint8_t predLayers = edge_sensor_compute_inference_layers(edgeSensor);
+            printf("Prediction on Cloud: %d\n", PREDICTION_ON_CLOUD(predLayers));
+            printf("Prediction on Gateway: %d\n", PREDICTION_ON_GATEWAY(predLayers));
+            printf("Prediction on Device: %d\n", PREDICTION_ON_DEVICE(predLayers));
+
+            /* Edge Sensor takes a measurement */
             float measurement = edge_sensor_measure(edgeSensor);
 
-            // Edge Sensor makes a prediction if necessary
-            float prediction;
-            float *prediction_ptr = NULL;
+            /* Generate JSON log payload */
+            cJSON *jsonPayload = cJSON_CreateObject();
+            cJSON_AddNumberToObject(jsonPayload, "measurement", measurement);
 
-            if (edgeSensor->predictiveModel != NULL) {
-                es_tflite_predict(&measurement, &prediction);
-                prediction_ptr = &prediction;
+            /* Publish measurement to MQTT broker */
+            publish_measurement(client, edgeSensor->deviceName, jsonPayload);
+
+            /* Free the cJSON object */
+            cJSON_Delete(jsonPayload);
+
+            if (PREDICTION_ON_GATEWAY(predLayers) || PREDICTION_ON_CLOUD(predLayers)) {
+                /* Generate JSON log payload */
+                cJSON *jsonPayload = cJSON_CreateObject();
+
+                /* Get a timestamp from the timer */
+                uint64_t _uint64_timestamp = edge_sensor_timer_get_time();
+                printf("Timestamp in microseconds: %llu (us)\n", _uint64_timestamp);
+                char request_timestamp[21] = {0};
+                from_uint64_to_string(_uint64_timestamp, request_timestamp);
+
+                /* generate prediction request payload */
+                edge_sensor_prediction_request_payload(jsonPayload, request_timestamp, measurement);
+
+                /* publish prediction request to MQTT broker */
+                publish_prediction_request(client, edgeSensor->deviceName, jsonPayload, predLayers);
+
+                /* Free the cJSON object */
+                cJSON_Delete(jsonPayload);
             }
 
-            // Publish measurement to MQTT broker
-            publish_measurement(client, edgeSensor->deviceName, measurement, prediction_ptr);
+
+            if (PREDICTION_ON_DEVICE(predLayers)) {
+                float prediction;
+                es_tflite_predict(&measurement, &prediction);
+                
+                // TODO: implement handle for prediction
+                // [...]
+
+                /* Generate JSON log payload */
+                if (ESN_DEBUG_MODE) {
+                    printf("Debug mode: generating JSON log payload\n");
+                    cJSON *jsonPayload = cJSON_CreateObject();
+
+                    char measurement_buffer[10] = {0};
+                    from_float_to_string(measurement, measurement_buffer);
+                    char prediction_buffer[10] = {0};
+                    from_float_to_string(prediction, prediction_buffer);
+                    edge_sensor_prediction_log_payload(jsonPayload, "edge-sensor", "0", "0", measurement_buffer, prediction_buffer);
+                    publish_prediction_log(client, edgeSensor->deviceName, jsonPayload);
+                    cJSON_Delete(jsonPayload);
+                }
+            }
         }
         
         /* Save edge sensor to NVS */
@@ -124,4 +177,7 @@ void app_main(void)
 
     /* Start MQTT */
     start_mqtt(client, &edgeSensor);
+
+    uint64_t timestamp = edge_sensor_timer_get_time(); // microseconds
+    printf("Timestamp in miliseconds: %llu (ms)\n", timestamp / 1000);
 }
