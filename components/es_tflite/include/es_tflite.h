@@ -5,11 +5,19 @@
 extern "C" {
 #endif
 
-#include "edge_sensor.h"
+#include <stdint.h>
 
-const float kXrange = 2.f * 3.14159265359f;
-void es_tflite_init(ES_PredictiveModel *predictiveModel);
-void es_tflite_predict(float *inputData, float *outputData);
+typedef float float32_t;
+typedef unsigned char uint8_t;
+
+#define TFLITE_OP_RESOLVER_SIZE 70
+#define SEQUENCE_LENGTH 25
+#define SAMPLE_SIZE 6
+
+void es_tflite_init(uint8_t *predictiveModelBuffer);
+void es_tflite_predict(float32_t **inputData, uint8_t *outputData);
+
+
 
 #ifdef __cplusplus
 }

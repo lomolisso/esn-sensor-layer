@@ -168,12 +168,8 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-void ble_prov_init(void)
+esp_err_t ble_prov_init(void)
 {
-
-    /* Initialize NVS PoP partition */
-    ESP_ERROR_CHECK(nvs_flash_init_partition(EDGE_SENSOR_PARTITION));
-
     wifi_semaphore = xSemaphoreCreateBinary();
 
     /* Register our event handler for Wi-Fi, IP and Provisioning related events */
@@ -196,6 +192,8 @@ void ble_prov_init(void)
     /* Initialize provisioning manager with the
      * configuration parameters set above */
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+
+    return ESP_OK;
 }
 
 void start_ble_prov(void)

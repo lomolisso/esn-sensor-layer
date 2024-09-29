@@ -4,45 +4,58 @@
 #include "tensorflow/lite/schema/schema_generated.h"
 
 #include "es_tflite.h"
-#include <string>
+
+#define ADD_OPERATION_TO_RESOLVER(op) \
+    if (resolver.op() != kTfLiteOk) { \
+        MicroPrintf(TAG, #op " resolver failed"); \
+        return; \
+    }
+
 
 namespace
 {
     const tflite::Model *model = nullptr;
     tflite::MicroInterpreter *interpreter = nullptr;
+    tflite::MicroMutableOpResolver<TFLITE_OP_RESOLVER_SIZE> resolver;
+    
     TfLiteTensor *input = nullptr;
     TfLiteTensor *output = nullptr;
-    int inference_count = 0;
 
-    constexpr int kTensorArenaSize = 2 * 1024;
+    constexpr int kTensorArenaSize = 16 * 1024;
     uint8_t tensor_arena[kTensorArenaSize];
+
+    static const char *TAG = "ES_TFLM";
 }
 
-extern "C" void es_tflite_init(ES_PredictiveModel *predictiveModel)
+extern "C" void es_tflite_init(uint8_t *predictiveModelBuffer)
 {
+    if (predictiveModelBuffer == nullptr)
+    {
+        MicroPrintf("Predictive model is NULL.\n");
+        return;
+    }
+
     // Map the model into a usable data structure. This doesn't involve any
     // copying or parsing, it's a very lightweight operation.
-    if (predictiveModel == nullptr)
-    {
-        MicroPrintf("Model is null");
-        return;
-    }
-
-    model = tflite::GetModel(predictiveModel->buffer);
+    model = tflite::GetModel(predictiveModelBuffer);
     if (model->version() != TFLITE_SCHEMA_VERSION)
     {
-        MicroPrintf("Model provided is schema version %d not equal to supported "
-                    "version %d.",
-                    model->version(), TFLITE_SCHEMA_VERSION);
+        MicroPrintf("TFLITE_SCHEMA_VERSION mismatch.\n");
+        MicroPrintf("Expected: %d\n", TFLITE_SCHEMA_VERSION);
+        MicroPrintf("Received: %d\n", model->version());
         return;
     }
 
-    // Pull in only the operation implementations we need.
-    static tflite::MicroMutableOpResolver<1> resolver;
-    if (resolver.AddFullyConnected() != kTfLiteOk)
-    {
-        return;
-    }
+    ADD_OPERATION_TO_RESOLVER(AddQuantize)
+    ADD_OPERATION_TO_RESOLVER(AddDequantize)
+    ADD_OPERATION_TO_RESOLVER(AddConv2D)
+    ADD_OPERATION_TO_RESOLVER(AddDepthwiseConv2D)
+    ADD_OPERATION_TO_RESOLVER(AddMaxPool2D)
+    ADD_OPERATION_TO_RESOLVER(AddReshape)
+    ADD_OPERATION_TO_RESOLVER(AddFullyConnected)
+    ADD_OPERATION_TO_RESOLVER(AddSoftmax)
+    ADD_OPERATION_TO_RESOLVER(AddRelu)
+    ADD_OPERATION_TO_RESOLVER(AddExpandDims)
 
     // Build an interpreter to run the model with.
     static tflite::MicroInterpreter static_interpreter(
@@ -53,7 +66,7 @@ extern "C" void es_tflite_init(ES_PredictiveModel *predictiveModel)
     TfLiteStatus allocate_status = interpreter->AllocateTensors();
     if (allocate_status != kTfLiteOk)
     {
-        MicroPrintf("AllocateTensors() failed");
+        MicroPrintf("AllocateTensors() failed.\n");
         return;
     }
 
@@ -61,39 +74,67 @@ extern "C" void es_tflite_init(ES_PredictiveModel *predictiveModel)
     input = interpreter->input(0);
     output = interpreter->output(0);
 
-    // Keep track of how many inferences we have performed.
-    inference_count = 0;
-    MicroPrintf("Model loaded successfully\n");
+    MicroPrintf("Model loaded successfully.\n");
 }
 
-extern "C" void es_tflite_predict(float *inputData, float *outputData)
+
+void _preprocess_input(float **inputData)
 {
-    // Calculate an x value to feed into the model. We compare the current
-    // inference_count to the number of inferences per cycle to determine
-    // our position within the range of possible x values the model was
-    // trained on, and use this to calculate a value.
+    /*
+    This function quantizes the input sequence of samples from float to uint8.
+    */
+    for (int i = 0; i < SEQUENCE_LENGTH; i++)
+    {
+        for (int j = 0; j < SAMPLE_SIZE; j++)
+        {
+            uint8_t x_quantized = inputData[i][j] / input->params.scale + input->params.zero_point;
+            input->data.uint8[i * SAMPLE_SIZE + j] = x_quantized;
+        }
+    }
+}
 
-    float x = (*inputData) * kXrange;
+void _postprocess_output(uint8_t *outputData)
+{
+    /*
+    This applies the argmax function to the output data to obtain the most likely class.
+    */
+    uint8_t max_index = 0;
+    uint8_t max_value = 0;
+    uint8_t numClasses = output->dims->data[1];
+    MicroPrintf("Number of classes: %d\n", numClasses);
 
-    // Quantize the input from floating-point to integer
-    int8_t x_quantized = x / input->params.scale + input->params.zero_point;
+    for (int i = 1; i < numClasses; i++)
+    {
+        if (output->data.uint8[i] > max_value)
+        {
+            max_value = output->data.uint8[i];
+            max_index = i;
+        }
+    }
+    *outputData = max_index;
+}
 
-    // Place the quantized input in the model's input tensor
-    input->data.int8[0] = x_quantized;
+extern "C" void es_tflite_predict(float32_t **inputData, uint8_t *outputData)
+{   
+    /*
+    Input is a sequence of SEQUENCE_LENGTH samples, each with SAMPLE_SIZE floating-point values.
+    The model went through full integer quantization, so the input and output tensors are expected to be uint8.
+    Therefore, the input data must be quantized to uint8 before being placed in the model's input tensor.
+    The output is a list of probabilities for each class, and the most likely class is obtained by applying the argmax function.
+    Consequently, the output data does not need to be dequantized, i.e. Argmax can be applied directly to the output tensor.
+    */
 
-    // Run inference, and report any error
+    // Step 1: Quantize the input data interating over the sequence of samples
+    _preprocess_input(inputData);
+
+    // Step 2: Run inference
     TfLiteStatus invoke_status = interpreter->Invoke();
     if (invoke_status != kTfLiteOk)
     {
-        MicroPrintf("Invoke failed on x: %f\n",
-                    static_cast<double>(x));
+        MicroPrintf("Invoke() failed.\n");
         return;
     }
 
-    // Obtain the quantized output from model's output tensor
-    int8_t y_quantized = output->data.int8[0];
-
-    // Dequantize the output from integer to floating-point
-    float y = (y_quantized - output->params.zero_point) * output->params.scale;
-    *outputData = y;
+    // Step 3: Dequantize the output data
+    _postprocess_output(outputData);
 }

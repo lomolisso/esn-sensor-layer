@@ -4,34 +4,20 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+
 #include "esp_event.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_log.h"
 #include <cJSON.h>
 
-/* Sizes */
-#define TOPIC_BUFFER_MAX_SIZE 100
-#define COMMAND_NAME_MAX_SIZE 32
-#define COMMAND_METHOD_MAX_SIZE 4
-#define COMMAND_UUID_MAX_SIZE 37
-
-/* Allowed command methods */
-#define COMMAND_METHOD_SET "set"
-
-/* Enqueued commands */
-#define REQUEST_PENDING_COMMANDS "request-pending-commands"
-#define RESPONSE_PENDING_COMMANDS "response-pending-commands"
-
-/* Publish topics */
-#define EXPORT_DATA "export-data"
-#define PREDICTION_LOG "debug-prediction-log"
-
-static const char *CONFIG_BROKER_URL = "mqtt://192.168.4.1:1883";
+static const char *CONFIG_BROKER_URL = "mqtt://192.168.4.135:1883";
 static const char *TAG = "ES_MQTT";
 
 /* MQTT Utils */
-
-bool validate_json(cJSON *jsonPayload)
+bool _validate_json(cJSON *jsonPayload) 
 {
     if (jsonPayload == NULL)
     {
@@ -44,7 +30,7 @@ bool validate_json(cJSON *jsonPayload)
     return jsonPayload != NULL;
 }
 
-void get_command_name(const char *topic, char *buffer, size_t buffer_size)
+void _get_property_name(const char *topic, char *buffer, size_t buffer_size)
 {
     char format[50];
     snprintf(format, sizeof(format), "command/%%*[^/]/%%%zus", buffer_size - 1);
@@ -56,7 +42,7 @@ void get_command_name(const char *topic, char *buffer, size_t buffer_size)
         *first_slash = '\0';
 }
 
-void get_command_method(const char *topic, char *buffer, size_t buffer_size)
+void _get_cmd_method(const char *topic, char *buffer, size_t buffer_size)
 {
     char format[50];
     snprintf(format, sizeof(format), "command/%%*[^/]/%%*[^/]/%%%zus", buffer_size - 1);
@@ -64,7 +50,7 @@ void get_command_method(const char *topic, char *buffer, size_t buffer_size)
     buffer[buffer_size - 1] = '\0'; // Ensure null termination
 }
 
-void get_command_uuid(const char *topic, char *buffer, size_t buffer_size)
+void _get_cmd_uuid(const char *topic, char *buffer, size_t buffer_size)
 {
     char format[50];
     snprintf(format, sizeof(format), "command/%%*[^/]/%%*[^/]/%%*[^/]/%%%zu[0-9a-fA-F-]", buffer_size - 1);
@@ -72,213 +58,95 @@ void get_command_uuid(const char *topic, char *buffer, size_t buffer_size)
     buffer[buffer_size - 1] = '\0'; // Ensure null termination
 }
 
+
 /* MQTT Topics */
 
-void get_publish_topic(char *topic_buffer, size_t buffer_size, const char *device_name, const char *topic)
+void get_export_topic(char *topic_buffer, size_t buffer_size, const char *device_name, const char *export_name)
 {
-    snprintf(topic_buffer, buffer_size, "incoming/data/%s/%s", device_name, topic);
+    snprintf(topic_buffer, buffer_size, "export/%s/%s", device_name, export_name);
 }
 
-void get_subscribe_topic(char *topic_buffer, size_t buffer_size, const char *device_name, const char *topic, const char *method)
+void get_response_topic(char *topic_buffer, size_t buffer_size, const char *device_name, const char *property_name, const char *cmd_method, const char *cmd_uuid)
 {
-    snprintf(topic_buffer, buffer_size, "command/%s/%s/%s/#", device_name, topic, method);
+    snprintf(topic_buffer, buffer_size, "response/%s/%s/%s/%s", device_name, property_name, cmd_method, cmd_uuid);
 }
 
-void get_command_response_topic(char *topic_buffer, size_t buffer_size, char *uuid)
+void get_command_topic(char *topic_buffer, size_t buffer_size, const char *device_name, const char *property_name, const char *cmd_method, const char *cmd_uuid)
 {
-    snprintf(topic_buffer, buffer_size, "command/response/%s", uuid);
+    snprintf(topic_buffer, buffer_size, "command/%s/%s/%s/%s", device_name, property_name, cmd_method, cmd_uuid);
 }
 
 /* MQTT Publish */
-
-void publish_command_response(esp_mqtt_client_handle_t client, char *device_name, char *command_uuid, char *response)
+void publish_export_sensor_data(esp_mqtt_client_handle_t client, char *device_name, cJSON *jsonPayload)
 {
+    char *payload = cJSON_Print(jsonPayload);
+
     /* Get publish topic */
-    char command_response_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_command_response_topic(command_response_topic_buffer, TOPIC_BUFFER_MAX_SIZE, command_uuid);
+    char export_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_export_topic(export_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, ES_EXPORT_SENSOR_DATA);
+
+    /* Publish measurement to MQTT broker */
+    esp_mqtt_client_publish(client, export_topic_buffer, payload, 0, 0, 0);
+
+    ESP_LOGI(TAG, "Published export sensor-data on topic %s", export_topic_buffer);
+    free(payload);
+}
+
+void publish_cmd_response(esp_mqtt_client_handle_t client, char *device_name, char *property_name, char *cmd_uuid, cJSON *jsonPayload)
+{
+    char *payload = cJSON_Print(jsonPayload);
+
+    /* Get publish topic */
+    char response_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_response_topic(response_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, property_name, CMD_METHOD_GET, cmd_uuid);
 
     /* Publish command response to MQTT broker */
-    esp_mqtt_client_publish(client, command_response_topic_buffer, response, 0, 1, 0);
+    esp_mqtt_client_publish(client, response_topic_buffer, payload, 0, 1, 0);
 
-    ESP_LOGI(TAG, "published command response on topic %s", command_response_topic_buffer);
-}
-
-void publish_request_pending_commands(esp_mqtt_client_handle_t client, char *device_name, int pending_commands)
-{
-    /* Create JSON payload using cJSON */
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, REQUEST_PENDING_COMMANDS, pending_commands);
-
-    char *payload = cJSON_Print(root);
-    cJSON_Delete(root); // Free the cJSON object
-
-    /* Get publish topic */
-    char pending_commands_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_publish_topic(pending_commands_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, REQUEST_PENDING_COMMANDS);
-
-    /* Publish pending commands to MQTT broker */
-    esp_mqtt_client_publish(client, pending_commands_topic_buffer, payload, 0, 2, 0);
-
-    ESP_LOGI(TAG, "published %s on topic %s", payload, pending_commands_topic_buffer);
-    free(payload);
-}
-
-void publish_measurement(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
-{
-    char *payload = cJSON_Print(jsonPayload);
-
-    /* Get publish topic */
-    char measurement_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_publish_topic(measurement_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, EXPORT_DATA);
-
-    /* Publish measurement to MQTT broker */
-    esp_mqtt_client_publish(client, measurement_topic_buffer, payload, 0, 1, 0);
-
-    ESP_LOGI(TAG, "published %s on topic %s", payload, measurement_topic_buffer);
-    free(payload);
-}
-
-void publish_cloud_prediction_request(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
-{
-    char *payload = cJSON_Print(jsonPayload);
-
-    /* Get publish topic */
-    char prediction_request_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_publish_topic(prediction_request_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, CLOUD_PREDICTION_REQUEST);
-
-    /* Publish measurement to MQTT broker */
-    esp_mqtt_client_publish(client, prediction_request_topic_buffer, payload, 0, 1, 0);
-
-    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_request_topic_buffer);
-    free(payload);
-}
-
-void publish_gateway_prediction_request(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
-{
-    char *payload = cJSON_Print(jsonPayload);
-
-    /* Get publish topic */
-    char prediction_request_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_publish_topic(prediction_request_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, GATEWAY_PREDICTION_REQUEST);
-
-    /* Publish measurement to MQTT broker */
-    esp_mqtt_client_publish(client, prediction_request_topic_buffer, payload, 0, 1, 0);
-
-    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_request_topic_buffer);
-    free(payload);
-}
-
-void publish_prediction_request(esp_mqtt_client_handle_t client, char *deviceName, cJSON *jsonPayload, uint8_t predLayers) {
-    if (PREDICTION_ON_GATEWAY(predLayers)) {
-        publish_gateway_prediction_request(client, deviceName, jsonPayload);
-    }
-    if (PREDICTION_ON_CLOUD(predLayers)) {
-        publish_cloud_prediction_request(client, deviceName, jsonPayload);
-    }
-}
-
-void publish_prediction_log(esp_mqtt_client_handle_t client, char *device_name, cJSON* jsonPayload)
-{
-    char *payload = cJSON_Print(jsonPayload);
-
-    /* Get publish topic */
-    char prediction_log_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_publish_topic(prediction_log_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, PREDICTION_LOG);
-
-    /* Publish measurement to MQTT broker */
-    esp_mqtt_client_publish(client, prediction_log_topic_buffer, payload, 0, 1, 0);
-
-    ESP_LOGI(TAG, "published %s on topic %s", payload, prediction_log_topic_buffer);
+    ESP_LOGI(TAG, "Published command response on topic %s", response_topic_buffer);
     free(payload);
 }
 
 /* MQTT Subscribe */
-
-void subscribe_to_pending_commands_topic(esp_mqtt_client_handle_t client, char *device_name)
+void _subscribe_to_command(esp_mqtt_client_handle_t client, char *device_name, char *property_name, char *method)
 {
     /* Get subscribe topic */
-    char pending_commands_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    get_subscribe_topic(pending_commands_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, RESPONSE_PENDING_COMMANDS, COMMAND_METHOD_SET);
+    char command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
+    get_command_topic(command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, property_name, method, MQTT_TOPIC_WILDCARD);
 
-    /* Subscribe to pending commands topic */
-    esp_mqtt_client_subscribe(client, pending_commands_topic_buffer, 0);
+    /* Subscribe to command topic */
+    esp_mqtt_client_subscribe(client, command_topic_buffer, 1);
 
-    ESP_LOGI(TAG, "successfully subscribed to pending commands topic");
+    ESP_LOGI(TAG, "Subscribed to command topic %s", command_topic_buffer);
 }
 
-void subscribe_to_state_machine_topics(esp_mqtt_client_handle_t client, char *device_name)
+void subscribe_to_property_commands(esp_mqtt_client_handle_t client, char *device_name)
 {
-    /* List of state machine topics */
-    char *state_machine_topics[] = {
-        SM_READY_COMMAND,
-        SM_START_COMMAND,
-        SM_STOP_COMMAND,
-        SM_RESET_COMMAND
-    };
+    /* Subscribe to property 'sensor-state' commands */
+    _subscribe_to_command(client, device_name, ES_PROPERTY_SENSOR_STATE, CMD_METHOD_SET);
+    _subscribe_to_command(client, device_name, ES_PROPERTY_SENSOR_STATE, CMD_METHOD_GET);
 
-    char state_machine_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    int num_topics = sizeof(state_machine_topics) / sizeof(state_machine_topics[0]);
-    for (int i = 0; i < num_topics; i++)
-    {
-        /* Get subscribe topic */
-        get_subscribe_topic(state_machine_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, state_machine_topics[i], COMMAND_METHOD_SET);
+    /* Subscribe to property 'inference-layer' commands */
+    _subscribe_to_command(client, device_name, ES_PROPERTY_INFERENCE_LAYER, CMD_METHOD_SET);
+    _subscribe_to_command(client, device_name, ES_PROPERTY_INFERENCE_LAYER, CMD_METHOD_GET);
 
-        /* Subscribe to state machine topic */
-        esp_mqtt_client_subscribe(client, state_machine_command_topic_buffer, 0);
+    /* Subscribe to property 'sensor-config' commands */
+    _subscribe_to_command(client, device_name, ES_PROPERTY_SENSOR_CONFIG, CMD_METHOD_SET);
+    _subscribe_to_command(client, device_name, ES_PROPERTY_SENSOR_CONFIG, CMD_METHOD_GET);
 
-    }
-    ESP_LOGI(TAG, "successfully subscribed to state machine topics");
+    /* Subscribe to property 'sensor-model' command */
+    _subscribe_to_command(client, device_name, ES_PROPERTY_SENSOR_MODEL, CMD_METHOD_SET);
 }
 
-void subscribe_to_predictive_model_topics(esp_mqtt_client_handle_t client, char *device_name)
-{
-    /* List of predictive model topics */
-    char *predictive_model_topics[] = {
-        PREDICTIVE_MODEL_COMMAND,
-        PREDICTION_COMMAND
-    };
-
-    char predictive_model_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    int num_topics = sizeof(predictive_model_topics) / sizeof(predictive_model_topics[0]);
-    for (int i = 0; i < num_topics; i++)
-    {
-        /* Get subscribe topic */
-        get_subscribe_topic(predictive_model_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, predictive_model_topics[i], COMMAND_METHOD_SET);
-
-        /* Subscribe to predictive model topic */
-        esp_mqtt_client_subscribe(client, predictive_model_command_topic_buffer, 0);
-
-    }
-    ESP_LOGI(TAG, "successfully subscribed to predictive model topics");
-}
-
-void subscribe_to_config_topics(esp_mqtt_client_handle_t client, char *device_name)
-{
-    /* List of config topics */
-    char *config_topics[] = {
-        CONFIG_DEVICE_COMMAND
-    };
-
-    char config_command_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
-    int num_topics = sizeof(config_topics) / sizeof(config_topics[0]);
-    for (int i = 0; i < num_topics; i++)
-    {
-        /* Get subscribe topic */
-        get_subscribe_topic(config_command_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, config_topics[i], COMMAND_METHOD_SET);
-
-        /* Subscribe to config topic */
-        esp_mqtt_client_subscribe(client, config_command_topic_buffer, 0);
-
-    }
-    ESP_LOGI(TAG, "successfully subscribed to config topics");
-}
-
-
+/* MQTT Event Handler */
 void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
-    /* Retrieve Edge Sensor pointer from handler_args */
-    EdgeSensor *edgeSensor = (EdgeSensor *)handler_args;
+    MqttHandlerArgs *mqttHandlerArgs = (MqttHandlerArgs *)handler_args;
+    
+    /* Retrieve Edge Sensor pointer from mqtt handler args */
+    EdgeSensor *edgeSensor = mqttHandlerArgs->edgeSensor;
+    TaskHandle_t measurementTaskHandle = mqttHandlerArgs->measurementTaskHandle;
 
     /* Retrieve event and client */
     esp_mqtt_event_handle_t event = event_data;
@@ -287,98 +155,62 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
     switch ((esp_mqtt_event_id_t)event_id)
     {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        ESP_LOGI(TAG, "ESP32 connected to MQTT broker");
 
-        /* Subscribe to state machine topics */
-        subscribe_to_state_machine_topics(client, edgeSensor->deviceName);
+        /* Subscribe to property commands */
+        subscribe_to_property_commands(client, edgeSensor->deviceName);
 
-        /* Subscribe to predictive model topics */
-        subscribe_to_predictive_model_topics(client, edgeSensor->deviceName);
-
-        /* Subscribe to config topics */
-        subscribe_to_config_topics(client, edgeSensor->deviceName);
-
-        /* Subscribe to pending commands topic */
-        subscribe_to_pending_commands_topic(client, edgeSensor->deviceName);
-
-        /* Publish pending commands request to MQTT broker */
-        publish_request_pending_commands(client, edgeSensor->deviceName, 0);
+        /* Notify measurement task */
+        if (measurementTaskHandle != NULL) {
+            xTaskNotifyGive(measurementTaskHandle);
+        } else {
+            ESP_LOGE(TAG, "Measurement task handle is NULL");
+        }
         break;
 
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        // print topic and length
-        ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+        /* Get CommandSemaphore */
+        xSemaphoreTake(edgeSensor->mutexSemaphore, portMAX_DELAY);
 
-        // print data and length
-        ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
-
+        /* Get topic and payload */
         char *topic = event->topic;
         char *payload = event->data;
+        ESP_LOGI(TAG, "ESP32 received MQTT message from topic %s", topic);
 
-        /* Get command name, method and uuid */
-        char commandName[COMMAND_NAME_MAX_SIZE];
-        get_command_name(topic, commandName, COMMAND_NAME_MAX_SIZE);
+        /* Get property name, cmd method and cmd uuid */
+        char propertyName[PROPERTY_NAME_MAX_SIZE];
+        _get_property_name(topic, propertyName, PROPERTY_NAME_MAX_SIZE);
 
-        char commandMethod[COMMAND_METHOD_MAX_SIZE];
-        get_command_method(topic, commandMethod, COMMAND_METHOD_MAX_SIZE);
+        char cmdMethod[CMD_METHOD_MAX_SIZE];
+        _get_cmd_method(topic, cmdMethod, CMD_METHOD_MAX_SIZE);
 
-        char commandUUID[COMMAND_UUID_MAX_SIZE];
-        get_command_uuid(topic, commandUUID, COMMAND_UUID_MAX_SIZE);
+        char cmdUUID[CMD_UUID_MAX_SIZE];
+        _get_cmd_uuid(topic, cmdUUID, CMD_UUID_MAX_SIZE);
 
-        /* only support set commands */
-        if (strcmp(commandMethod, COMMAND_METHOD_SET) != 0)
-        {
-            printf("Invalid command method: %s\n", commandMethod);
-            return;
-        }
-
-        /* parse payload into JSON */
+        /* Parse payload into JSON */
         cJSON *jsonPayload = cJSON_Parse(payload);
-        if (!validate_json(jsonPayload))
+        if (!_validate_json(jsonPayload))
         {
-            printf("Invalid JSON payload: %s\n", payload);
+            ESP_LOGI(TAG, "Invalid JSON payload: %s\n", payload);
             return;
         }
 
-        if (strcmp(commandName, RESPONSE_PENDING_COMMANDS) == 0)
+        /* Verify cmdMethod is either SET or GET */
+        if (strcmp(cmdMethod, CMD_METHOD_SET) != 0 && strcmp(cmdMethod, CMD_METHOD_GET) != 0)
         {
-            /* handle pending commands */
-            cJSON *JSON_pendingCommands = cJSON_GetObjectItem(jsonPayload, commandName);
-            int pendingCommands = cJSON_IsNumber(JSON_pendingCommands) ? JSON_pendingCommands->valueint : 0;
-            *(edgeSensor->pendingCommands) = pendingCommands;
-            printf("Edge Sensor has %d pending commands.\n", pendingCommands);
-            if (pendingCommands == 0)
-            {
-                xSemaphoreGive(edgeSensor->commandSemaphore);
-            }
+            ESP_LOGI(TAG, "Invalid command method: %s\n", cmdMethod);
+            return;
         }
-        else 
-        {
-            /* call edge sensor command handler */
-            printf("Calling edge sensor command handler for command %s\n", commandName);
-            edgeSensor->commandHandler(edgeSensor, commandName, jsonPayload);
-        }
-        
-        /* free JSON payload */
-        cJSON_Delete(jsonPayload);
 
-        if (ESN_DEBUG_MODE && edgeSensor->predictionLogJson != NULL) {
-            /* Publish prediction log to MQTT broker */
-            publish_prediction_log(client, edgeSensor->deviceName, edgeSensor->predictionLogJson);
-            cJSON_Delete(edgeSensor->predictionLogJson);
-            
-            /* Reset predictionLogJson to NULL */
-            edgeSensor->predictionLogJson = NULL;
+        cJSON *response = edgeSensor->commandHandler(edgeSensor, propertyName, cmdMethod, jsonPayload);
+        if (response != NULL && strcmp(cmdMethod, CMD_METHOD_GET))
+        {
+            publish_cmd_response(client, edgeSensor->deviceName, propertyName, cmdUUID, response);
+            cJSON_Delete(response);
         }
-        
-        /* Publish command response to MQTT broker */
-        cJSON *commandResponse = cJSON_CreateObject();
-        cJSON_AddStringToObject(commandResponse, commandName, "success");
-        char *response = cJSON_Print(commandResponse);
-        publish_command_response(client, edgeSensor->deviceName, commandUUID, response);
-        free(response);
-        cJSON_Delete(commandResponse);
+
+        /* Return CommandSemaphore */
+        xSemaphoreGive(edgeSensor->mutexSemaphore);
         break;
     default:
         break;
@@ -389,15 +221,16 @@ esp_mqtt_client_handle_t mqtt_init()
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_BROKER_URL,
-        .buffer.size = 12 * 1024,
+        .buffer.size = 16 * 1024,
         .buffer.out_size = 1024,
+        .session.disable_clean_session = 1,
     };
 
     return esp_mqtt_client_init(&mqtt_cfg);
 }
 
-void start_mqtt(esp_mqtt_client_handle_t client, EdgeSensor *edgeSensor)
+void start_mqtt(esp_mqtt_client_handle_t client, MqttHandlerArgs *mqttHandlerArgs)
 {
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, (void *)edgeSensor);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, (void *)mqttHandlerArgs);
     esp_mqtt_client_start(client);
 }
