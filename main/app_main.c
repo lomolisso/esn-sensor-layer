@@ -1,5 +1,6 @@
 #include <nvs_flash.h>
 #include <esp_netif.h>
+#include <esp_wifi.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -19,139 +20,215 @@
 
 #define DEVICE_NAME_MAX_LENGTH 13
 #define EDGE_SENSOR_PARTITION "edge_sensor_data"
+#define POLL_WAIT_TIME 500
 
+static const char *TAG = "APP_MAIN";
+
+// Edge Sensor
+static EdgeSensor edgeSensor;
+static char deviceName[DEVICE_NAME_MAX_LENGTH];
+
+// Measurement Task
 typedef struct _measurementTaskParams
 {
     EdgeSensor *edgeSensor;
-    esp_mqtt_client_handle_t client;
 } MeasurementTaskParams;
-
-
-static const char *TAG = "APP_MAIN";
-static EdgeSensor edgeSensor;
-static char deviceName[DEVICE_NAME_MAX_LENGTH];
 
 static MeasurementTaskParams measurementTaskParams;
 static TaskHandle_t measurementTaskHandle;
 
+// MQTT
 static MqttHandlerArgs mqttHandlerArgs;
 static esp_mqtt_client_handle_t client;
 
-typedef struct {
-    uint8_t sleep_flag;
-} rtc_data_t;
-
-RTC_DATA_ATTR static rtc_data_t rtc_data = { .sleep_flag = 0 };
-
-/* Utils */
-void printHeapInfo()
+// RTC Data
+typedef struct
 {
-    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "Free heap size: %zu bytes\n", freeHeap);
-    size_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "Largest free contiguous heap block: %zu bytes\n", largestFreeBlock);
+    uint8_t sleep_flag;
+    uint8_t poll_period;
+    uint8_t poll_idx;
+} rtc_data_t;
+RTC_DATA_ATTR static rtc_data_t rtc_data = {.sleep_flag = 0, .poll_period = 20, .poll_idx = 0};
+
+// MQTT Client
+void launch_mqtt_client(){
+    // Initialize Wi-Fi
+    ESP_LOGI(TAG, "Initializing Wi-Fi");
+    ESP_ERROR_CHECK(es_wifi_init());
+
+    // Start Wi-Fi
+    ESP_LOGI(TAG, "Starting Wi-Fi");
+    es_wifi_start();
+
+    // Initialize MQTT
+    ESP_LOGI(TAG, "Initializing MQTT");
+    ESP_ERROR_CHECK(es_mqtt_init(&client));
+
+    // Start MQTT
+    ESP_LOGI(TAG, "Starting MQTT");
+    mqttHandlerArgs.edgeSensor = &edgeSensor;
+    mqttHandlerArgs.measurementTaskHandle = measurementTaskHandle;
+    es_mqtt_start(&client, &mqttHandlerArgs);
+    
+    // Wait for MQTT to connect and subscribe to topics
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
 
-/* Measurement Task */
+// Measurement Task
+void __handle_on_device_inf(EdgeSensor *edgeSensor)
+{
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Get sensor reading buffer and predictive model
+    float32_t **readingBuffer = edgeSensor->bmi270->readingBuffer;
+    ES_PredictiveModel *predictiveModel = edgeSensor->predictiveModel;
+
+    // Measure reading from bmi270
+    es_bmi270_measure(readingBuffer);
+
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // DEBUG: copy the first 25 samples to the model input buffer
+    float **buff = malloc(25 * sizeof(float *));
+    for (int i = 0; i < 25; i++)
+    {
+        buff[i] = malloc(6 * sizeof(float));
+        for (int j = 0; j < 6; j++)
+        {
+            buff[i][j] = readingBuffer[i][j];
+        }
+    }
+
+    // Initialize the TFLM model
+    es_tflite_init(predictiveModel->buffer);
+
+    // Perform on-device inference
+    uint8_t tf_model_output;
+    es_tflite_predict(buff, &tf_model_output);
+
+    // Free reading buffer
+    free_reading_buffer(readingBuffer);
+    free(buff);
+
+    // Update Prediction Counter and History
+    UPDATE_PREDICTION_COUNTER(predictiveModel->predictionCounter);
+    UPDATE_PREDICTION_HISTORY(predictiveModel->predictionHistory, tf_model_output);
+    edge_sensor_update_inference_layer(edgeSensor);
+
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Poll Enqueued Commands if poll index is 0
+    if (rtc_data.poll_idx == 0)
+    {
+        // Launch MQTT Client
+        launch_mqtt_client();
+
+        // Wait a fixed amount of time to ensure all commands are received
+        vTaskDelay(POLL_WAIT_TIME / portTICK_PERIOD_MS);
+    }
+}
+
+void __handle_offload_inf(EdgeSensor *edgeSensor)
+{
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Get sensor raw reading buffer
+    uint8_t *rawReadingBuffer = edgeSensor->bmi270->rawReadingBuffer;
+
+    // Measure raw reading from bmi270
+    es_bmi270_raw_measure(rawReadingBuffer);
+
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Compress raw reading
+    size_t compressed_length;
+    uint8_t *compressed_reading = compress_bytes(rawReadingBuffer, BMI270_SEQUENCE_LENGTH * BMI270_SAMPLE_SIZE * 2, &compressed_length);
+    free_raw_reading_buffer(rawReadingBuffer);
+
+    // Encode compressed reading to base64
+    size_t b64_encoded_length;
+    char *b64_gzip_reading = encode_base64(compressed_reading, compressed_length, &b64_encoded_length);
+    free(compressed_reading);
+
+    // DEBUG: delay for 5 seconds
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // Create cJSON object
+    cJSON *jsonPayload = cJSON_CreateObject();
+
+    // Build export sensor data payload
+    SensorDataExport sensorDataExport = {
+        .lowBattery = IS_LOW_BATTERY(edgeSensor->remainingBattery),
+        .inferenceLayer = edgeSensor->inferenceLayer,
+        .b64_gzip_reading = b64_gzip_reading,
+        .sendTimestamp = NULL,
+        .recvTimestamp = NULL,
+        .prediction = NULL
+    };
+    build_export_sensor_data_payload(jsonPayload, &sensorDataExport);
+
+    // Convert cJSON object to payload
+    char *payload = cJSON_Print(jsonPayload);
+
+    // Free cJSON object
+    cJSON_Delete(jsonPayload);
+
+    // Free b64_gzip_reading
+    free(b64_gzip_reading);
+
+    // Launch MQTT Client
+    launch_mqtt_client();
+
+    // Publish sensor data
+    publish_export_sensor_data(client, edgeSensor->deviceName, payload);
+
+    // Wait a fixed amount of time to ensure all commands are received
+    vTaskDelay(POLL_WAIT_TIME / portTICK_PERIOD_MS);
+
+    // DEBUG: delay for 5 seconds
+    //vTaskDelay(5000 / portTICK_PERIOD_MS);
+}
+
 void edge_sensor_measurement_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Starting Edge Sensor Measurement Task");
     MeasurementTaskParams *params = (MeasurementTaskParams *)pvParameters;
     EdgeSensor *edgeSensor = params->edgeSensor;
-    //esp_mqtt_client_handle_t client = params->client;
-
-    SemaphoreHandle_t mutexSemaphore = edgeSensor->mutexSemaphore;
-    ES_StateMachine *stateMachine = edgeSensor->stateMachine;
-    ES_PredictiveModel *predictiveModel = edgeSensor->predictiveModel;
-    float32_t **readingBuffer = edgeSensor->bmi270->readingBuffer;
-
+    ES_State state = edgeSensor->stateMachine->state;
     while (true)
     {
-        /* Wait for the mqtt handler to notify the task */
-        //ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        /* Retrieve Edge Sensor State Safely */
-        ESP_LOGI(TAG, "Mutex Semaphore requested.\n");
-        xSemaphoreTake(mutexSemaphore, portMAX_DELAY);
-        ESP_LOGI(TAG, "Mutex Semaphore received.\n");
-        ES_State state = stateMachine->state;
-        ESP_LOGI(TAG, "Mutex Semaphore given.\n");
-        xSemaphoreGive(mutexSemaphore);
-
         switch (state)
         {
         case STATE_WORKING:
             ESP_LOGI(TAG, "Edge Sensor State: STATE_WORKING.\n");
-            cJSON *jsonPayload = cJSON_CreateObject();
-            /* Get sensor reading */
-
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-
-            ESP_LOGI(TAG, "Measuring BMI270 Sensor.\n");
-            es_bmi270_measure(readingBuffer);
-
-            /* Retrieve Edge Sensor Inference Layer Safely */
-            ESP_LOGI(TAG, "Mutex Semaphore requested.\n");
-            xSemaphoreTake(mutexSemaphore, portMAX_DELAY);
-            ESP_LOGI(TAG, "Mutex Semaphore received.\n");
-            ESP_LOGI(TAG, "Mutex Semaphore given.\n");
-            xSemaphoreGive(mutexSemaphore);
-
-            /* Perform on-device inference if necessary */
-            uint8_t *prediction = NULL;
-            uint8_t tf_model_output;
-            
-            if (edgeSensor->inferenceLayer == INFERENCE_LAYER_SENSOR)
+            ES_InferenceLayer inferenceLayer = edgeSensor->inferenceLayer;
+            if (inferenceLayer == INFERENCE_LAYER_SENSOR)
             {
-                vTaskDelay(2000 / portTICK_PERIOD_MS);
-
-                // Initialize TFLM model
-                ESP_LOGI(TAG, "Initializing TFLM model.\n");
-                es_tflite_init(predictiveModel->buffer);
-                
-                // Run TFLite model
-                ESP_LOGI(TAG, "Performing on-device inference.\n");
-                
-                es_tflite_predict(readingBuffer, &tf_model_output);
-        
-                UPDATE_PREDICTION_COUNTER(predictiveModel->predictionCounter);
-                UPDATE_PREDICTION_HISTORY(predictiveModel->predictionHistory, tf_model_output);
-                edge_sensor_update_inference_layer(edgeSensor);
-                prediction = &tf_model_output;
-                
-                 vTaskDelay(2000 / portTICK_PERIOD_MS);
+                // Perform on-device inference
+                __handle_on_device_inf(edgeSensor);
             }
-
-
-            /* Build JSON payload */
-            ESP_LOGI(TAG, "Building export 'sensor-data' JSON payload.\n");
-            SensorDataExport sensorDataExport = {
-                .lowBattery = IS_LOW_BATTERY(edgeSensor->remainingBattery),
-                //.inferenceLayer = edgeSensor->inferenceLayer,
-                .inferenceLayer = INFERENCE_LAYER_GATEWAY,
-                .reading = readingBuffer,
-                .sendTimestamp = NULL,
-                .recvTimestamp = NULL,
-                .prediction = prediction};
-            build_export_sensor_data_payload(jsonPayload, &sensorDataExport);
-
-            /* Publish sensor data */
-            //ESP_LOGI(TAG, "Publishing export 'sensor-data' to MQTT broker.\n");
-            //publish_export_sensor_data(client, edgeSensor->deviceName, jsonPayload);
-
-            /* Free JSON payload */
-            cJSON_Delete(jsonPayload);
+            else
+            {
+                // Perform offload inference
+                __handle_offload_inf(edgeSensor);
+            }
             break;
 
         default:
-            ESP_LOGI(TAG, "Edge Sensor State: %s.\n", FROM_ENUM_STATE_TO_STRING(stateMachine->state));
+            ESP_LOGI(TAG, "Edge Sensor State: %s.\n", FROM_ENUM_STATE_TO_STRING(state));
+
+            // Launch MQTT Client
+            launch_mqtt_client();
+
+            // Wait a fixed amount of time to ensure all commands are received
+            vTaskDelay(POLL_WAIT_TIME / portTICK_PERIOD_MS);
             break;
         }
-
-        /* Take Mutex Semaphore */
-        ESP_LOGI(TAG, "Mutex Semaphore requested.\n");
-        xSemaphoreTake(mutexSemaphore, portMAX_DELAY);
-        ESP_LOGI(TAG, "Mutex Semaphore received.\n");
 
         /* Save edge sensor to NVS */
         ESP_LOGI(TAG, "Saving edge sensor to NVS.\n");
@@ -163,93 +240,67 @@ void edge_sensor_measurement_task(void *pvParameters)
     }
 }
 
-void app_init(void)
+
+// Main App
+esp_err_t app_init(void)
 {
-    /* Initialize NVS partition */
+    // Update the poll index
+    ESP_LOGI(TAG, "Updating poll index");
+    rtc_data.poll_idx = (rtc_data.poll_idx + 1) % rtc_data.poll_period;
+
+    // Initialize event loop
+    ESP_LOGI(TAG, "Initializing event loop");
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Initialize NVS partition
     ESP_LOGI(TAG, "Initializing NVS partition");
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(nvs_flash_init_partition(EDGE_SENSOR_PARTITION));
 
-    /* Initialize TCP/IP */
-    //ESP_LOGI(TAG, "Initializing TCP/IP stack");
-    //ESP_ERROR_CHECK(esp_netif_init());
+    // Init Wi-Fi and check if provisioned
+    if (!is_device_provisioned())
+    {
+        // Initialize BLE Prov
+        ESP_LOGI(TAG, "Initializing BLE Prov");
+        ESP_ERROR_CHECK(es_ble_prov_init());
 
-    /* Initialize event loop */
-    ESP_LOGI(TAG, "Initializing event loop");
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+        // Start BLE Prov
+        ESP_LOGI(TAG, "Starting BLE Prov");
+        es_ble_prov_start(); // Reboots after provisioning
+    }
 
-    /* Initialize BLE Prov*/
-    //ESP_LOGI(TAG, "Initializing BLE Prov");
-    //ESP_ERROR_CHECK(ble_prov_init());
+    // Initialize the sensor
+    ESP_LOGI(TAG, "Initializing the sensor");
+    get_device_name(deviceName, DEVICE_NAME_MAX_LENGTH);
+    ESP_LOGI(TAG, "Device Name: %s\n", deviceName);
+
+    ESP_LOGI(TAG, "Initializing Edge Sensor Struct.\n");
+    ESP_ERROR_CHECK(edge_sensor_init(&edgeSensor, deviceName, rtc_data.sleep_flag));
+
+    // Initialize the sensor
+    ES_BMI270 *bmi270 = edgeSensor.bmi270;
+    es_bmi270_init(bmi270->configSize, bmi270->configBuffer, rtc_data.sleep_flag);
+
+    // Update sleep flag
+    rtc_data.sleep_flag = 1;
+
+    return ESP_OK;
 }
 
 void app_main(void)
 {
-    /* Initialize App */
-    ESP_LOGI(TAG, "Initializing App");
-    app_init();
+    // step 0: Initialize the app
+    ESP_LOGI(TAG, "Initializing the APP");
+    ESP_ERROR_CHECK(app_init());
 
-    /* Start BLE Prov */
-    //ESP_LOGI(TAG, "Starting BLE Prov");
-    //start_ble_prov();
-
-    /* Get device name from BLE iface MAC address */
-    //get_device_name(deviceName, DEVICE_NAME_MAX_LENGTH);
-    char *deviceName = "ESP32_24A1C2";
-    ESP_LOGI(TAG, "Device Name: %s\n", deviceName);
-
-    //ESP_ERROR_CHECK(reset_nvs_edge_sensor());
-    ESP_LOGI(TAG, "Initializing Edge Sensor Struct.\n");
-    printHeapInfo();
-    ESP_ERROR_CHECK(edge_sensor_init(&edgeSensor, deviceName));
-    ESP_LOGI(TAG, "Edge sensor initialized.\n");
-    printHeapInfo();
-
-    /* Initialize BMI270 Sensor */
-    ES_BMI270 *bmi270 = edgeSensor.bmi270;
-    if (bmi270 != NULL)
-    {
-        ESP_LOGI(TAG, "Initializing BMI270 Sensor.\n");
-        es_bmi270_init(bmi270->configSize, bmi270->configBuffer, rtc_data.sleep_flag);
-    }
-    else
-    {
-        ESP_LOGI(TAG, "BMI270 sensor is NULL, BMI270 initialization skipped.\n");
-    }
-
-    rtc_data.sleep_flag = 1;
-
-    /* Initialize TFLM model */
-    //ES_PredictiveModel *predictiveModel = edgeSensor.predictiveModel;
-    //edgeSensor.inferenceLayer = INFERENCE_LAYER_SENSOR;
-    //if (predictiveModel != NULL && edgeSensor.inferenceLayer == INFERENCE_LAYER_SENSOR)
-    //{
-    //    ESP_LOGI(TAG, "Initializing TFLM model.\n");
-    //   es_tflite_init(predictiveModel->buffer);
-    //}
-    //else
-    //{
-    //    ESP_LOGI(TAG, "Predictive model is NULL or inference layer is not INFERENCE_LAYER_SENSOR, TFLM initialization skipped.\n");
-    //}
-
-    /* Initialize MQTT */
-    //ESP_LOGI(TAG, "Initializing MQTT Client");
-    //client = mqtt_init();
-
-    /* Create Edge Sensor Measurement Task */
+    // step 1: Set up the measurement task parameters
     measurementTaskParams.edgeSensor = &edgeSensor;
-    measurementTaskParams.client = client;
-    
+
+    // step 2: Create the measurement task
     xTaskCreate(edge_sensor_measurement_task, "edge_sensor_measurement_task", 4096, &measurementTaskParams, 5, &measurementTaskHandle);
     if (measurementTaskHandle == NULL)
     {
         ESP_LOGE(TAG, "Failed to create edge sensor measurement task");
         vTaskDelete(measurementTaskHandle);
     }
-
-    /* Start MQTT */
-    //ESP_LOGI(TAG, "Starting MQTT Client");
-    //mqttHandlerArgs.edgeSensor = &edgeSensor;
-    //mqttHandlerArgs.measurementTaskHandle = measurementTaskHandle;
-    //start_mqtt(client, &mqttHandlerArgs);
 }

@@ -77,10 +77,8 @@ void get_command_topic(char *topic_buffer, size_t buffer_size, const char *devic
 }
 
 /* MQTT Publish */
-void publish_export_sensor_data(esp_mqtt_client_handle_t client, char *device_name, cJSON *jsonPayload)
+void publish_export_sensor_data(esp_mqtt_client_handle_t client, char *device_name, char *payload)
 {
-    char *payload = cJSON_Print(jsonPayload);
-
     /* Get publish topic */
     char export_topic_buffer[TOPIC_BUFFER_MAX_SIZE];
     get_export_topic(export_topic_buffer, TOPIC_BUFFER_MAX_SIZE, device_name, ES_EXPORT_SENSOR_DATA);
@@ -169,9 +167,6 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
         break;
 
     case MQTT_EVENT_DATA:
-        /* Get CommandSemaphore */
-        xSemaphoreTake(edgeSensor->mutexSemaphore, portMAX_DELAY);
-
         /* Get topic and payload */
         char *topic = event->topic;
         char *payload = event->data;
@@ -208,16 +203,13 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
             publish_cmd_response(client, edgeSensor->deviceName, propertyName, cmdUUID, response);
             cJSON_Delete(response);
         }
-
-        /* Return CommandSemaphore */
-        xSemaphoreGive(edgeSensor->mutexSemaphore);
         break;
     default:
         break;
     }
 }
 
-esp_mqtt_client_handle_t mqtt_init()
+esp_err_t es_mqtt_init(esp_mqtt_client_handle_t *client)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_BROKER_URL,
@@ -226,11 +218,13 @@ esp_mqtt_client_handle_t mqtt_init()
         .session.disable_clean_session = 1,
     };
 
-    return esp_mqtt_client_init(&mqtt_cfg);
+    *client = esp_mqtt_client_init(&mqtt_cfg);
+
+    return ESP_OK;
 }
 
-void start_mqtt(esp_mqtt_client_handle_t client, MqttHandlerArgs *mqttHandlerArgs)
+void es_mqtt_start(esp_mqtt_client_handle_t *client, MqttHandlerArgs *mqttHandlerArgs)
 {
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, (void *)mqttHandlerArgs);
-    esp_mqtt_client_start(client);
+    esp_mqtt_client_register_event(*client, ESP_EVENT_ANY_ID, mqtt_event_handler, (void *)mqttHandlerArgs);
+    esp_mqtt_client_start(*client);
 }

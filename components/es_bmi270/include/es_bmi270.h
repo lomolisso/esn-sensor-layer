@@ -12,7 +12,7 @@
 #define I2C_MASTER_SDA_IO GPIO_NUM_21
 #define I2C_BMI_NUM I2C_NUM_0
 // I2C frequency (Hz)
-#define I2C_MASTER_FREQ_HZ 10000
+#define I2C_MASTER_FREQ_HZ 100000
 
 // I2C slave address
 #define ESP_SLAVE_ADDR 0x68
@@ -47,8 +47,9 @@
 
 /* BMI 270 Sensor */
 #define BMI270_SAMPLE_SIZE 6
-#define BMI270_SEQUENCE_LENGTH 25
+#define BMI270_SEQUENCE_LENGTH 500
 
 void es_bmi270_init(size_t configSize, uint8_t *configBuffer, uint8_t sleep_flag);
+void es_bmi270_raw_measure(uint8_t *rawReadingBuffer);
 void es_bmi270_measure(float **readingBuffer);
 

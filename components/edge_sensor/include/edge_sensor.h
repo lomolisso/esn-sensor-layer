@@ -26,7 +26,7 @@ typedef float float32_t;
 #define IS_LOW_BATTERY(remainingBattery) (remainingBattery < REMAINING_BATTERY_THRESHOLD)
 
 #define BMI270_SAMPLE_SIZE 6
-#define BMI270_SEQUENCE_LENGTH 25
+#define BMI270_SEQUENCE_LENGTH 500
 
 /* NVS */
 #define EDGE_SENSOR_PARTITION "edge_sensor_data"
@@ -177,9 +177,10 @@ struct _ES_StateMachine
 /* ES_BMI270 */
 struct _ES_BMI270
 {
-    uint8_t *configBuffer;
+    uint8_t *configBuffer; // NULL for all cycles except the first
     uint32_t configSize;
-    float32_t **readingBuffer;
+    float32_t **readingBuffer; // Allocated when on-device inference is required
+    uint8_t *rawReadingBuffer; // Allocated when signal compression is required
 };
 
 /* Edge Sensor Structure */
@@ -196,8 +197,6 @@ struct edgeSensor
     
     ES_CommandHandler commandHandler;
     ES_StateMachine *stateMachine;
-
-    SemaphoreHandle_t mutexSemaphore;
 };
 
 /* Utility Function Declarations */
@@ -207,13 +206,14 @@ void from_uint64_to_string(uint64_t timestamp, char *buffer);
 typedef struct sensorDataExport
 {
     uint8_t lowBattery;
-    float32_t **reading;
+    char *b64_gzip_reading; // char * || NULL
     uint8_t inferenceLayer;
     uint64_t *sendTimestamp; // uint64_t || NULL
     uint64_t *recvTimestamp; // uint64_t || NULL
     uint8_t *prediction;     // uint8_t || NULL
 } SensorDataExport;
 void build_export_sensor_data_payload(cJSON *jsonPayload, SensorDataExport *sensorDataExport);
+uint8_t *compress_json_payload(char *jsonPayload);
 
 /* Command Handler Function Declarations */
 cJSON *es_command_handler(EdgeSensor *edgeSensor, const char *propertyName, const char *cmdMethod, cJSON *payload);
@@ -239,7 +239,7 @@ uint8_t get_nvs_bmi270_config_flag();
 #define NVS_INFERENCE_LAYER_SENSOR_KEY "inference_layer"
 #define NVS_SENSOR_BATTERY_MANAGER_LOW_BATTERY_KEY "low_battery"
 #define NVS_SENSOR_REMAINING_BATTERY_KEY "rem_batt"
-#define NVS_SENSOR_MODEL_B64_KEY "model_bytes"
+#define NVS_SENSOR_MODEL_BYTES_KEY "model_bytes"
 #define NVS_SENSOR_MODEL_BYTESIZE_KEY "model_size"
 #define NVS_SENSOR_CONFIG_MEASUREMENT_INTERVAL_MS_KEY "sleep_t"
 #define NVS_SENSOR_STATE_KEY "sensor_state"
@@ -250,10 +250,18 @@ esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor);
 esp_err_t reset_nvs_edge_sensor();
 
 /* Edge Sensor Structure Function Declarations */
-esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName);
+esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName, uint8_t sleep_flag);
 
 void edge_sensor_measure(EdgeSensor *edgeSensor);
 void edge_sensor_sleep(EdgeSensor *edgeSensor);
 void edge_sensor_update_inference_layer(EdgeSensor *edgeSensor);
+
+uint8_t *compress_bytes(uint8_t *data, size_t data_len, size_t *compressed_len);
+char *encode_base64(uint8_t *data, size_t data_len, size_t *b64_encoded_len);
+
+void free_raw_reading_buffer(uint8_t *rawReadingBuffer);
+void free_reading_buffer(float32_t **readingBuffer);
+
+void printHeapInfo();
 
 #endif // EDGE_SENSOR_H

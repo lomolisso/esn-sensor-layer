@@ -11,13 +11,26 @@
 #include "inttypes.h"
 #include <string.h>
 #include "mbedtls/base64.h"
-#include "es_miniz.h"
 
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 
+#include "zlib.h"
+
 static const char *TAG = "EDGE_SENSOR";
+
+// Heap info imports
+#include "esp_heap_caps.h"
+
+
+void printHeapInfo()
+{
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Free heap size: %zu bytes\n", freeHeap);
+    size_t largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Largest free contiguous heap block: %zu bytes\n", largestFreeBlock);
+}
 
 
 /* Utils */
@@ -53,18 +66,7 @@ void build_export_sensor_data_payload(cJSON *jsonPayload, SensorDataExport *sens
     cJSON_AddBoolToObject(jsonPayload, SENSOR_DATA_LOW_BATTERY_FIELD, sensorDataExport->lowBattery);
 
     // Create the "reading" field
-    cJSON *reading = cJSON_CreateObject();
-    cJSON *values = cJSON_CreateArray();
-    for (int i = 0; i < BMI270_SEQUENCE_LENGTH; i++)
-    {
-        cJSON *row = cJSON_CreateArray();
-        for (int j = 0; j < BMI270_SAMPLE_SIZE; j++)
-        {
-            cJSON_AddItemToArray(row, cJSON_CreateNumber(sensorDataExport->reading[i][j]));
-        }
-        cJSON_AddItemToArray(values, row);
-    }
-    cJSON_AddItemToObject(reading, SENSOR_DATA_READING_VALUES_FIELD, values);
+    cJSON *reading = cJSON_CreateString(sensorDataExport->b64_gzip_reading);
     cJSON_AddItemToObject(jsonPayload, SENSOR_DATA_READING_FIELD, reading);
 
     // Create the "inference_descriptor" field
@@ -105,6 +107,74 @@ void build_export_sensor_data_payload(cJSON *jsonPayload, SensorDataExport *sens
     cJSON_AddItemToObject(jsonPayload, SENSOR_DATA_INFERENCE_DESCRIPTOR_FIELD, inferenceDescriptor);
 }
 
+uint8_t *compress_bytes(uint8_t *data, size_t data_len, size_t *compressed_len)
+{
+    ESP_LOGI(TAG, "Starting Compression for %zu bytes\n", data_len);
+
+    uLongf compressed_size = compressBound(data_len);
+    uint8_t *compressed_data = (uint8_t *)malloc(compressed_size);
+    
+    printHeapInfo();
+    
+    
+    
+    int compress_status = compress(compressed_data, &compressed_size, (const Bytef *)data, data_len);
+    if (compress_status == Z_OK)
+    {
+        ESP_LOGI(TAG, "Compression successful.\n");
+        ESP_LOGI(TAG, "Original size: %lu\n", (unsigned long)data_len);
+        ESP_LOGI(TAG, "Compressed size: %lu\n", (unsigned long)compressed_size);
+
+        // Set the compressed length and return the compressed data
+        *compressed_len = compressed_size;
+
+        return compressed_data;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Compression failed!, status: %d\n", compress_status);
+        return NULL;
+    }
+}
+
+
+char *encode_base64(uint8_t *data, size_t data_len, size_t *b64_encoded_len)
+{
+    size_t b64_encoded_size = 0;
+    int ret = 0;
+
+    // First, get the required buffer size for the base64 encoded data
+    ret = mbedtls_base64_encode(NULL, 0, &b64_encoded_size, data, data_len);
+    if (ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL)
+    {
+        ESP_LOGE(TAG, "Failed to get the required buffer size for base64 encoding\n");
+        return NULL;
+    }
+
+    // Allocate memory for the base64 encoded data
+    char *b64_encoded_buffer = (char *)malloc(b64_encoded_size);
+    if (b64_encoded_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate memory for base64 encoded data\n");
+        return NULL;
+    }
+
+    // Perform the actual base64 encoding
+    ret = mbedtls_base64_encode((unsigned char *)b64_encoded_buffer, b64_encoded_size, &b64_encoded_size, data, data_len);
+    if (ret != 0)
+    {
+        ESP_LOGE(TAG, "Failed to encode data to base64\n");
+        free(b64_encoded_buffer);
+        return NULL;
+    }
+
+    // Set the output length and return the encoded buffer
+    *b64_encoded_len = b64_encoded_size;
+    return b64_encoded_buffer;
+}
+
+
+
 /* Reading Buffer */
 float32_t **alloc_reading_buffer()
 {
@@ -134,6 +204,26 @@ float32_t **alloc_reading_buffer()
     return reading;
 }
 
+uint8_t *alloc_raw_reading_buffer()
+{
+    /*
+    The BMI270 IMU sensor produces 6 elements per sample, each element is a int16_t, hence 
+    we need 2 uint8_t to store each element. 
+
+    ...| msb__acc_x | lsb__acc_x | msb__acc_y | lsb__acc_y | msb__acc_z | lsb__acc_z | msb__gyr_x | lsb__gyr_x | msb__gyr_y | lsb__gyr_y | msb__gyr_z | lsb__gyr_z |...    
+
+    */
+    uint8_t *reading = (uint8_t *)malloc(BMI270_SEQUENCE_LENGTH * BMI270_SAMPLE_SIZE * 2);
+    if (reading == NULL)
+    {
+        return NULL; // Memory allocation failed
+    }
+    return reading;
+}
+
+
+
+
 void free_reading_buffer(float32_t **reading)
 {
     // Frees the allocated buffer
@@ -146,6 +236,16 @@ void free_reading_buffer(float32_t **reading)
         free(reading);
     }
 }
+
+void free_raw_reading_buffer(uint8_t *reading)
+{
+    // Frees the allocated buffer
+    if (reading != NULL)
+    {
+        free(reading);
+    }
+}
+
 
 /* NVS Edge Sensor Flags Functions */
 esp_err_t _set_nvs_edge_sensor_flag(const char *key, uint8_t value)
@@ -303,18 +403,18 @@ esp_err_t save_edge_sensor_to_nvs(EdgeSensor *edgeSensor)
 
     /* predictive model */
     if (edgeSensor->predictiveModel != NULL)
-        {
-            ESP_LOGI(TAG, "Saving predictive model to NVS.\n");
-            err = nvs_set_u32(nvs_handle, NVS_SENSOR_MODEL_BYTESIZE_KEY, edgeSensor->predictiveModel->size);
-            if (err != ESP_OK)
-                return err;
+    {
+        ESP_LOGI(TAG, "Saving predictive model to NVS.\n");
+        err = nvs_set_u32(nvs_handle, NVS_SENSOR_MODEL_BYTESIZE_KEY, edgeSensor->predictiveModel->size);
+        if (err != ESP_OK)
+            return err;
 
-            size_t model_size = edgeSensor->predictiveModel->size;
-            ESP_LOGI(TAG, "Model size: %d bytes\n", model_size);
-            err = nvs_set_blob(nvs_handle, NVS_SENSOR_MODEL_B64_KEY, (const void *)edgeSensor->predictiveModel->buffer, model_size);
-            if (err != ESP_OK)
-                return err;
-        }
+        size_t model_size = edgeSensor->predictiveModel->size;
+        ESP_LOGI(TAG, "Model size: %d bytes\n", model_size);
+        err = nvs_set_blob(nvs_handle, NVS_SENSOR_MODEL_BYTES_KEY, (const void *)edgeSensor->predictiveModel->buffer, model_size);
+        if (err != ESP_OK)
+            return err;
+    }
 
     /* config */
     if (edgeSensor->config != NULL)
@@ -505,10 +605,19 @@ cJSON *_es_handle_set_sensor_model(EdgeSensor *edgeSensor, cJSON *payload)
     cJSON_Delete(payload);
 
     /* Step 5: decompress the byte array using zlib */
-    mz_ulong uncompressed_length = model_size;
+    uLongf uncompressed_length = (uLongf)model_size;
     unsigned char *uncompressed_buffer = (unsigned char *)malloc(uncompressed_length);
-    int status = mz_uncompress(uncompressed_buffer, &uncompressed_length, decoded_buffer, written_bytes);
-    if (status != MZ_OK)
+    if (uncompressed_buffer == NULL)
+    {
+        ESP_LOGI(TAG, "Failed to allocate memory for uncompressed data\n");
+        free(decoded_buffer);
+        free(edgeSensor->predictiveModel);
+        edgeSensor->predictiveModel = NULL;
+        return response;
+    }
+
+    int status = uncompress(uncompressed_buffer, &uncompressed_length, decoded_buffer, (uLong)written_bytes);
+    if (status != Z_OK)
     {
         ESP_LOGI(TAG, "Failed to decompress model, error code: %d\n", status);
         free(decoded_buffer);
@@ -517,6 +626,7 @@ cJSON *_es_handle_set_sensor_model(EdgeSensor *edgeSensor, cJSON *payload)
         edgeSensor->predictiveModel = NULL;
         return response;
     }
+
 
     /* Step 6: free the decoded buffer as it is no longer needed */
     free(decoded_buffer);
@@ -792,15 +902,13 @@ void state_error_handler(EdgeSensor *edgeSensor, ES_Event event)
 }
 
 /* Edge Sensor Functions */
-esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
+esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName, uint8_t sleep_flag)
 {
     // step 1: initialize edge sensor
     edgeSensor->deviceName = deviceName;
     edgeSensor->inferenceLayer = INFERENCE_LAYER_SENSOR;
     edgeSensor->commandHandler = es_command_handler;
     
-    edgeSensor->mutexSemaphore = xSemaphoreCreateMutex();
-
     // step 2: initialize member structs with default values
     edgeSensor->stateMachine = (ES_StateMachine *)malloc(sizeof(ES_StateMachine));
     edgeSensor->stateMachine->state = STATE_INITIAL;
@@ -808,7 +916,12 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
 
     edgeSensor->predictiveModel = NULL;
     edgeSensor->config = NULL;
-    edgeSensor->bmi270 = NULL;
+
+    edgeSensor->bmi270 = (ES_BMI270 *)malloc(sizeof(ES_BMI270));
+    edgeSensor->bmi270->readingBuffer = NULL;
+    edgeSensor->bmi270->rawReadingBuffer = NULL;
+    edgeSensor->bmi270->configSize = 0;
+    edgeSensor->bmi270->configBuffer = NULL;
 
     // step 3: update member structs from NVS if necessary
     nvs_handle_t nvs_handle;
@@ -818,6 +931,33 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
     if (err != ESP_OK)
         return err;
 
+
+    // =================
+    // REMAINING BATTERY
+    // =================
+
+
+    if (!sleep_flag)
+    {
+        ESP_LOGI(TAG, "Setting remaining battery to BATTERY_CAPACITY.\n");
+        edgeSensor->remainingBattery = BATTERY_CAPACITY;
+    }
+    else {
+        ESP_LOGI(TAG, "Reading remaining battery from NVS.\n");
+        uint32_t remaining_battery_buffer;
+        err = nvs_get_u32(nvs_handle, NVS_SENSOR_REMAINING_BATTERY_KEY, &remaining_battery_buffer);
+        if (err != ESP_OK)
+            return err;
+        edgeSensor->remainingBattery = remaining_battery_buffer;
+    }
+
+
+    // =================
+    // INFERENCE LAYER
+    // =================
+
+
+    /* Read inference layer from NVS */
     uint8_t inf_flag = get_nvs_edge_sensor_inf_flag();
     if (inf_flag)
     {
@@ -828,20 +968,16 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
             return err;
         edgeSensor->inferenceLayer = (ES_InferenceLayer)inf_layer_buffer;
     }
+    edgeSensor->inferenceLayer = INFERENCE_LAYER_GATEWAY; // TODO: REMOVE THIS!, I re-defined inference layer for DEBUG, disables loading model.
 
-    uint8_t config_flag = get_nvs_edge_sensor_config_flag();
-    if (config_flag)
-    {
-        ESP_LOGI(TAG, "Reading config from NVS.\n");
-        edgeSensor->config = (ES_Config *)malloc(sizeof(ES_Config));
+    // ===================
+    // PREDICTIVE MODEL
+    // ===================
 
-        err = nvs_get_u32(nvs_handle, NVS_SENSOR_CONFIG_MEASUREMENT_INTERVAL_MS_KEY, &edgeSensor->config->measurementIntervalMS);
-        if (err != ESP_OK)
-            return err;
-    }
 
+    /* Read ES_PredictiveModel from NVS */
     uint8_t model_flag = get_nvs_edge_sensor_model_flag();
-    if (model_flag)
+    if (model_flag && edgeSensor->inferenceLayer == INFERENCE_LAYER_SENSOR) // only load model if inference layer is on device
     {
         ESP_LOGI(TAG, "Allocating memory for ES_PredictiveModel struct.\n");
         edgeSensor->predictiveModel = (ES_PredictiveModel *)malloc(sizeof(ES_PredictiveModel));
@@ -865,7 +1001,7 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
             return ESP_ERR_NO_MEM;
         }
         ESP_LOGI(TAG, "Reading predictive model from NVS.\n");
-        err = nvs_get_blob(nvs_handle, NVS_SENSOR_MODEL_B64_KEY, model_buffer, &model_size);
+        err = nvs_get_blob(nvs_handle, NVS_SENSOR_MODEL_BYTES_KEY, model_buffer, &model_size);
         if (err != ESP_OK)
         {
             free(model_buffer); // Free the allocated memory in case of error
@@ -874,16 +1010,66 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
         edgeSensor->predictiveModel->buffer = (uint8_t *)model_buffer;
     }
 
-    uint8_t sleep_flag = get_nvs_edge_sensor_sleep_flag();
-    if (sleep_flag)
+
+    // =================
+    // BMI270 IMU
+    // =================
+
+
+    /* Initialize BMI270 reading buffer */
+    ESP_LOGI(TAG, "Current inference layer: %d\n", edgeSensor->inferenceLayer);
+    if (edgeSensor->inferenceLayer == INFERENCE_LAYER_SENSOR)
     {
-        ESP_LOGI(TAG, "Reading remaining battery from NVS.\n");
-        uint32_t remaining_battery_buffer;
-        err = nvs_get_u32(nvs_handle, NVS_SENSOR_REMAINING_BATTERY_KEY, &remaining_battery_buffer);
+        ESP_LOGI(TAG, "Allocating memory for ES_BMI270->readingBuffer.\n");
+        edgeSensor->bmi270->readingBuffer = alloc_reading_buffer();
+    }
+    else {
+        ESP_LOGI(TAG, "Allocating memory for ES_BMI270->rawReadingBuffer.\n");
+        edgeSensor->bmi270->rawReadingBuffer = alloc_raw_reading_buffer();
+    }
+    /* Read ES_BMI270 Config from NVS if necessary */
+    uint8_t bmi270_config_flag = get_nvs_bmi270_config_flag();
+    if (bmi270_config_flag && !sleep_flag) // only load config if first cycle, i.e. havent slept yet
+    {
+        ESP_LOGI(TAG, "Reading BMI270 config size from NVS.\n");
+        uint32_t bmi270_config_size;
+        err = nvs_get_u32(nvs_handle, NVS_BMI270_CONFIG_SIZE_KEY, &bmi270_config_size);
         if (err != ESP_OK)
             return err;
-        edgeSensor->remainingBattery = remaining_battery_buffer;
+        edgeSensor->bmi270->configSize = bmi270_config_size;
+        
+        ESP_LOGI(TAG, "Allocating memory for ES_BMI270->configBuffer.\n");
+        uint8_t *bmi270ConfigBuffer = (uint8_t *)malloc(bmi270_config_size);
 
+        ESP_LOGI(TAG, "Reading BMI270 config from NVS.\n");
+        size_t buffer_size = (size_t)bmi270_config_size;
+        err = nvs_get_blob(nvs_handle, NVS_BMI270_CONFIG_KEY, bmi270ConfigBuffer, &buffer_size);
+        if (err != ESP_OK)
+            return err;
+        edgeSensor->bmi270->configBuffer = bmi270ConfigBuffer;
+    }
+
+    // ===================
+    // EDGE SENSOR CONFIG
+    // ===================
+
+
+    /* Read ES_Config from NVS */
+    uint8_t config_flag = get_nvs_edge_sensor_config_flag();
+    if (config_flag)
+    {
+        ESP_LOGI(TAG, "Reading config from NVS.\n");
+        edgeSensor->config = (ES_Config *)malloc(sizeof(ES_Config));
+
+        err = nvs_get_u32(nvs_handle, NVS_SENSOR_CONFIG_MEASUREMENT_INTERVAL_MS_KEY, &edgeSensor->config->measurementIntervalMS);
+        if (err != ESP_OK)
+            return err;
+    }
+
+    /* Read ES_State from NVS */
+    sleep_flag = 1; // TODO: REMOVE THIS!, I re-defined sleep flag for DEBUG, enables loading state.
+    if (sleep_flag)
+    {
         ESP_LOGI(TAG, "Reading state from NVS.\n");
         uint8_t state_buffer;
         err = nvs_get_u8(nvs_handle, NVS_SENSOR_STATE_KEY, &state_buffer);
@@ -910,32 +1096,6 @@ esp_err_t edge_sensor_init(EdgeSensor *edgeSensor, char *deviceName)
         }
     }
 
-    uint8_t bmi270_config_flag = get_nvs_bmi270_config_flag();
-    if (bmi270_config_flag)
-    {
-        ESP_LOGI(TAG, "Allocating memory for ES_BMI270 struct.\n");
-        edgeSensor->bmi270 = (ES_BMI270 *)malloc(sizeof(ES_BMI270));
-
-        ESP_LOGI(TAG, "Reading BMI270 config size from NVS.\n");
-        uint32_t bmi270_config_size;
-        err = nvs_get_u32(nvs_handle, NVS_BMI270_CONFIG_SIZE_KEY, &bmi270_config_size);
-        if (err != ESP_OK)
-            return err;
-        edgeSensor->bmi270->configSize = bmi270_config_size;
-        
-        ESP_LOGI(TAG, "Allocating memory for ES_BMI270->configBuffer.\n");
-        uint8_t *bmi270ConfigBuffer = (uint8_t *)malloc(bmi270_config_size);
-
-        ESP_LOGI(TAG, "Reading BMI270 config from NVS.\n");
-        err = nvs_get_blob(nvs_handle, NVS_BMI270_CONFIG_KEY, bmi270ConfigBuffer, &bmi270_config_size);
-        if (err != ESP_OK)
-            return err;
-        edgeSensor->bmi270->configBuffer = bmi270ConfigBuffer;
-
-        ESP_LOGI(TAG, "Allocating memory for ES_BMI270->readingBuffer.\n");
-        edgeSensor->bmi270->readingBuffer = alloc_reading_buffer();
-    }
-
     // Close NVS
     nvs_close(nvs_handle);
 
@@ -960,13 +1120,10 @@ void free_edge_sensor(EdgeSensor *edgeSensor)
     /* free state machine allocated memory */
     free(edgeSensor->stateMachine);
 
-    /* free reading buffer allocated memory */
-    free_reading_buffer(edgeSensor->bmi270->readingBuffer);
-    free(edgeSensor->bmi270->configBuffer);
+    if (edgeSensor->bmi270->configBuffer != NULL)
+        free(edgeSensor->bmi270->configBuffer);
+
     free(edgeSensor->bmi270);
-    
-    /* free command semaphore */
-    vSemaphoreDelete(edgeSensor->mutexSemaphore);
 }
 
 void get_hardcoded_measurement(float32_t **readingBuffer)

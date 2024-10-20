@@ -469,16 +469,10 @@ void print_data() {
 /* External functions */
 void es_bmi270_init(size_t configSize, uint8_t *configBuffer, uint8_t sleep_flag)
 {
-    if (configBuffer == NULL)
-    {
-        ESP_LOGE(TAG, "Config file is NULL\n");
-        return;
-    }
-
     ESP_ERROR_CHECK(bmi_init());
     //ESP_ERROR_CHECK(softreset());
     //ESP_ERROR_CHECK(chip_id());
-    if(sleep_flag == 0)
+    if(!sleep_flag && configBuffer != NULL)
     {
         ESP_ERROR_CHECK(softreset());
         ESP_ERROR_CHECK(chip_id());
@@ -490,7 +484,76 @@ void es_bmi270_init(size_t configSize, uint8_t *configBuffer, uint8_t sleep_flag
         ESP_ERROR_CHECK(set_gyr_range(SENSOR_GYR_RANGE));
         internal_status();
     }
+    else if(sleep_flag)
+    {
+        ESP_LOGI(TAG, "Sleep flag is set, skipping initialization\n");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Config buffer is NULL\n");
+    }
 }
+
+void es_bmi270_raw_measure(uint8_t *rawReadingBuffer)
+{
+    if (rawReadingBuffer == NULL)
+    {
+        ESP_LOGE(TAG, "Raw reading buffer is NULL\n");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Started measuring\n");
+    int i = 0;
+    while (1)
+    {
+        if (is_data_ready())
+        {
+            esp_err_t ret = ESP_OK;
+            uint8_t data_data8[12];
+            ret = bmi_read(I2C_BMI_NUM, &REG_DATA_8, (uint8_t *)data_data8, sizeof(data_data8));
+            if (ret != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Error while reading: %s \n", esp_err_to_name(ret));
+            }
+
+            // acc_x
+            rawReadingBuffer[i * 12 + 0] = data_data8[1]; // msb__acc_x
+            rawReadingBuffer[i * 12 + 1] = data_data8[0]; // lsb__acc_x
+
+            // acc_y
+            rawReadingBuffer[i * 12 + 2] = data_data8[3]; // msb__acc_y
+            rawReadingBuffer[i * 12 + 3] = data_data8[2]; // lsb__acc_y
+
+            // acc_z
+            rawReadingBuffer[i * 12 + 4] = data_data8[5]; // msb__acc_z
+            rawReadingBuffer[i * 12 + 5] = data_data8[4]; // lsb__acc_z
+
+            // gyr_x
+            rawReadingBuffer[i * 12 + 6] = data_data8[7]; // msb__gyr_x
+            rawReadingBuffer[i * 12 + 7] = data_data8[6]; // lsb__gyr_x
+
+            // gyr_y
+            rawReadingBuffer[i * 12 + 8] = data_data8[9];  // msb__gyr_y
+            rawReadingBuffer[i * 12 + 9] = data_data8[8];  // lsb__gyr_y
+
+            // gyr_z
+            rawReadingBuffer[i * 12 + 10] = data_data8[11]; // msb__gyr_z
+            rawReadingBuffer[i * 12 + 11] = data_data8[10]; // lsb__gyr_z
+
+
+            ESP_LOGI(TAG, "<RAW_S_%d> | acc_x: (%d, %d) | acc_y: (%d, %d) | acc_z: (%d, %d) | gyr_x: (%d, %d) | gyr_y: (%d, %d) | gyr_z: (%d, %d)",
+                     i, data_data8[1], data_data8[0], data_data8[3], data_data8[2], data_data8[5], data_data8[4], data_data8[7], data_data8[6], data_data8[9], data_data8[8], data_data8[11], data_data8[10]);
+
+            i += 1;
+            if (i >= BMI270_SEQUENCE_LENGTH)
+            {
+                break;
+            }
+        }
+    }
+}
+
+
 
 
 void es_bmi270_measure(float **readingBuffer)
@@ -533,9 +596,6 @@ void es_bmi270_measure(float **readingBuffer)
             readingBuffer[i][5] = gyr_z;
 
             ESP_LOGI(TAG, "<S_%d>  |  Acc: (%.2f, %.2f, %.2f) m/s²  |  Gy: (%.2f, %.2f, %.2f) rad/s", i, acc_x, acc_y, acc_z, gyr_x, gyr_y, gyr_z);
-            
-            // delay 200 ms
-            vTaskDelay(500 / portTICK_PERIOD_MS);
 
             i += 1;
             if (i >= BMI270_SEQUENCE_LENGTH)

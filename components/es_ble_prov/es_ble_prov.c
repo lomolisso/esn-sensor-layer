@@ -14,22 +14,18 @@
 
 static const char *TAG = "ES_BLE_PROV";
 
-/* Signal Wi-Fi events */
+// Signal Wi-Fi events
 static SemaphoreHandle_t wifi_semaphore;
 
-/* Bluetooth Config */
+// Bluetooth Config
 #define PROV_TRANSPORT_BLE "ble"
 #define SSID_PREFIX "ESP32_"
 
-/* Edge Sensor Partition */
+// Edge Sensor Partition
 #define EDGE_SENSOR_PARTITION "edge_sensor_data"
 #define EDGE_SENSOR_PARTITION_NAMESPACE "edge_sensor_ns"
 #define POP_KEY "pop_key"
 #define EDGE_SENSOR_BUFFER_SIZE 100
-
-/*
-    TODO: secure boot.
-*/
 
 esp_err_t get_device_pop(void *pop_data, size_t length)
 {
@@ -161,107 +157,123 @@ static void protocomm_security_session_event_handler(void *arg, esp_event_base_t
     }
 }
 
-static void wifi_init_sta(void)
+uint8_t is_device_provisioned(void)
 {
-    /* Start Wi-Fi in station mode */
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-}
-
-esp_err_t ble_prov_init(void)
-{
-    wifi_semaphore = xSemaphoreCreateBinary();
-
-    /* Register our event handler for Wi-Fi, IP and Provisioning related events */
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &wifi_prov_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, &protocomm_transport_ble_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &protocomm_security_session_event_handler, NULL));
-
-    /* Initialize Wi-Fi including netif with default config */
-    esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    /* Configuration for the provisioning manager */
+    bool provisioned = false;
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+    return provisioned;
+}
+
+esp_err_t es_ble_prov_init(void)
+{
+    // Register our event handler for Wi-Fi, IP and Provisioning related events
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &wifi_prov_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, &protocomm_transport_ble_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &protocomm_security_session_event_handler, NULL));
+
+    // Initialize Wi-Fi Semaphore
+    wifi_semaphore = xSemaphoreCreateBinary();
+
+    // Initialize TCP/IP stack
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    // Initialize Wi-Fi driver
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg); 
+
+    // Create default Wi-Fi station
+    esp_netif_create_default_wifi_sta();
+
+    // Configuration for the provisioning manager
     wifi_prov_mgr_config_t config = {
         .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM
+    };
 
-    /* Initialize provisioning manager with the
-     * configuration parameters set above */
+    // Initialize provisioning manager with the configuration parameters set above
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+
+    // Reset provisioning [DEBUG]
+    // wifi_prov_mgr_reset_provisioning();
 
     return ESP_OK;
 }
 
-void start_ble_prov(void)
+void es_ble_prov_start(void)
 {
-    bool provisioned = false;
-    // wifi_prov_mgr_reset_provisioning(); // TODO: comment on PROD.
+    /* 
+    WIFI_PROV_SECURITY_1: secure handshake using X25519 key exchange
+    and proof of possession (pop) and AES-CTR for encryption/decryption of messages. 
+    */
 
-    /* Let's find out if the device is provisioned */
-    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+    ESP_LOGI(TAG, "Starting provisioning");
 
-    /* If device is not yet provisioned start provisioning service */
-    if (!provisioned)
-    {
-        ESP_LOGI(TAG, "Starting provisioning");
-        char device_name[13];
-        ESP_ERROR_CHECK(get_device_name(device_name, sizeof(device_name)));
+    // Get device name
+    char device_name[13];
+    ESP_ERROR_CHECK(get_device_name(device_name, sizeof(device_name)));
+    wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
 
-        /* 
-        WIFI_PROV_SECURITY_1: secure handshake using X25519 key exchange
-        and proof of possession (pop) and AES-CTR for encryption/decryption of messages. 
-        */
-        wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
+    // Retrieve the PoP from the NVS partition
+    char pop[EDGE_SENSOR_BUFFER_SIZE] = {0}; // Initialize all elements to 0
+    size_t pop_length = sizeof(pop) - 1;     // Reserve one byte for null terminator
+    ESP_ERROR_CHECK(get_device_pop(pop, pop_length));
+    wifi_prov_security1_params_t *sec_params = pop;
 
-        // Retrieve the PoP from the NVS partition
-        char pop[EDGE_SENSOR_BUFFER_SIZE] = {0}; // Initialize all elements to 0
-        size_t pop_length = sizeof(pop) - 1;     // Reserve one byte for null terminator
-        ESP_ERROR_CHECK(get_device_pop(pop, pop_length));
+    // Set custom service UUID
+    uint8_t custom_service_uuid[] = {
+        0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
+        0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02,
+    };
+    wifi_prov_scheme_ble_set_service_uuid(custom_service_uuid);
 
-        wifi_prov_security1_params_t *sec_params = pop;
+    // Start provisioning service
+    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, (const void *)sec_params, device_name, NULL));
 
-        uint8_t custom_service_uuid[] = {
-            0xb4,
-            0xdf,
-            0x5a,
-            0x1c,
-            0x3f,
-            0x6b,
-            0xf4,
-            0xbf,
-            0xea,
-            0x4a,
-            0x82,
-            0x03,
-            0x04,
-            0x90,
-            0x1a,
-            0x02,
-        };
+    // Wait for Wi-Fi connection
+    wifi_prov_mgr_wait();
+    wifi_prov_mgr_deinit();
+    
+    // Wait for Wi-Fi connection
+    xSemaphoreTake(wifi_semaphore, portMAX_DELAY);
 
-        wifi_prov_scheme_ble_set_service_uuid(custom_service_uuid);
+    // Reboot the device
+    esp_restart();
+}
 
-        /* Start provisioning service */
-        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, (const void *)sec_params, device_name, NULL));
+esp_err_t es_wifi_init(void)
+{
+    // Register our event handler for Wi-Fi and IP related events
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
 
-        wifi_prov_mgr_wait();
-        wifi_prov_mgr_deinit();
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
+    // Initialize Wi-Fi Semaphore
+    wifi_semaphore = xSemaphoreCreateBinary();
 
-        /* We don't need the manager as device is already provisioned,
-         * so let's release it's resources */
-        wifi_prov_mgr_deinit();
+    // Initialize TCP/IP stack
+    ESP_ERROR_CHECK(esp_netif_init());
 
-        /* Start Wi-Fi station */
-        wifi_init_sta();
-    }
+    // Initialize Wi-Fi driver
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg); 
+
+    // Create default Wi-Fi station
+    esp_netif_create_default_wifi_sta();
+
+    return ESP_OK;
+}
+
+void es_wifi_start(void)
+{
+    /* Start Wi-Fi in station mode */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     /* Wait for Wi-Fi connection */
     xSemaphoreTake(wifi_semaphore, portMAX_DELAY);
