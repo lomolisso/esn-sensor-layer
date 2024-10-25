@@ -47,8 +47,9 @@ typedef struct
     uint8_t sleep_flag;
     uint8_t poll_period;
     uint8_t poll_idx;
+    uint64_t total_uptime_us;
 } rtc_data_t;
-RTC_DATA_ATTR static rtc_data_t rtc_data = {.sleep_flag = 0, .poll_period = 20, .poll_idx = 0};
+RTC_DATA_ATTR static rtc_data_t rtc_data = {.sleep_flag = 0, .poll_period = 20, .poll_idx = 0, .total_uptime_us = 0};
 
 // MQTT Client
 void launch_mqtt_client(){
@@ -162,11 +163,13 @@ void __handle_offload_inf(EdgeSensor *edgeSensor)
     cJSON *jsonPayload = cJSON_CreateObject();
 
     // Build export sensor data payload
+    uint64_t sleepDuration = rtc_data.sleep_flag ? edgeSensor->config->measurementIntervalMS*1000 : 0;
+    uint64_t sendTimestamp = rtc_data.total_uptime_us + sleepDuration + esp_timer_get_time();
     SensorDataExport sensorDataExport = {
         .lowBattery = IS_LOW_BATTERY(edgeSensor->remainingBattery),
         .inferenceLayer = edgeSensor->inferenceLayer,
         .b64_gzip_reading = b64_gzip_reading,
-        .sendTimestamp = NULL,
+        .sendTimestamp = &sendTimestamp,
         .recvTimestamp = NULL,
         .prediction = NULL
     };
@@ -236,6 +239,8 @@ void edge_sensor_measurement_task(void *pvParameters)
 
         /* Sleep edge sensor */
         ESP_LOGI(TAG, "Sleeping edge sensor.\n");
+        uint64_t sleep_duration = rtc_data.sleep_flag ? edgeSensor->config->measurementIntervalMS * 1000 : 0;
+        rtc_data.total_uptime_us += sleep_duration + esp_timer_get_time();
         edge_sensor_sleep(edgeSensor);
     }
 }

@@ -162,10 +162,14 @@ uint8_t is_device_provisioned(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    // Reset provisioning [DEBUG]
+    //wifi_prov_mgr_reset_provisioning();
+
     bool provisioned = false;
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
 
     ESP_ERROR_CHECK(esp_wifi_deinit());
+
     return provisioned;
 }
 
@@ -199,9 +203,6 @@ esp_err_t es_ble_prov_init(void)
 
     // Initialize provisioning manager with the configuration parameters set above
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
-
-    // Reset provisioning [DEBUG]
-    // wifi_prov_mgr_reset_provisioning();
 
     return ESP_OK;
 }
